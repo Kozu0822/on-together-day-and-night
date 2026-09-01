@@ -1,0 +1,9 @@
+{
+  "name": "OnTogether_Day_and_Night",
+  "version_number": "1.0.1",
+  "website_url": "",
+  "description": "A configurable real-time day and night cycle with weather, water, shadows, scene lighting, and ambience for On-Together.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2305"
+  ]
+}

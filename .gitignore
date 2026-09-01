@@ -1,0 +1,15 @@
+# Local game outputs and build artifacts
+On-Together_Day_and_Night.dll
+.build/
+
+# User-generated BepInEx configuration
+*.cfg
+
+# Editor and OS files
+.vs/
+bin/
+obj/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
