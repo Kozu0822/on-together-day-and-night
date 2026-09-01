@@ -8,6 +8,8 @@ at any time to make the island feel like your own.
 
 > **日本語:** On-Together 向けの昼夜・季節・環境演出モッドです。F11 の設定メニューから、時間の流れ、空や水面、照明、秋の景観、環境音をその場で調整できます。
 
+![Four moments on the island: summer day, autumn day, night, and dawn](images/day-night-cycle.png)
+
 ## Highlights
 
 - Watch the world shift naturally through dawn, daytime, sunset, moonlight, stars, clouds, and rain.
