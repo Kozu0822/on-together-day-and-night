@@ -18,7 +18,7 @@ namespace OnTogetherDayAndNight
     {
         // Iterations on top of the released 1.0.1 while the autumn update is being tried out.
         // The Thunderstore manifest stays at the last published x.y.z until a release is cut.
-        public const string PluginVersion = "1.0.1.4";
+        public const string PluginVersion = "1.0.1.10";
 
         // -------- grading config --------
         private ConfigEntry<bool> _gradingEnabled;
@@ -64,6 +64,10 @@ namespace OnTogetherDayAndNight
         private ConfigEntry<int> _leafFallTrees;
         private ConfigEntry<int> _groundLeafLimit;
         private ConfigEntry<float> _groundLeafLifetime;
+        private ConfigEntry<float> _autumnWaterTint;
+        private ConfigEntry<float> _autumnSunElevation;
+        private ConfigEntry<bool> _harvestMoon;
+        private ConfigEntry<bool> _leavesOnWater;
         private ConfigEntry<bool> _halloweenStringLights;
 
         // -------- day cycle config --------
@@ -162,9 +166,9 @@ namespace OnTogetherDayAndNight
         // -------- weather config --------
         private ConfigEntry<bool> _weatherEnabled;
         private ConfigEntry<bool> _randomRain;
+        private ConfigEntry<bool> _alwaysRain;
+        private ConfigEntry<float> _rainChance;
         private ConfigEntry<string> _rainToggleKey;
-        private ConfigEntry<float> _clearMinutesMin;
-        private ConfigEntry<float> _clearMinutesMax;
         private ConfigEntry<float> _rainMinutesMin;
         private ConfigEntry<float> _rainMinutesMax;
         private ConfigEntry<float> _weatherTransitionSeconds;
@@ -174,6 +178,9 @@ namespace OnTogetherDayAndNight
         private ConfigEntry<float> _thunderChancePerMinute;
         private ConfigEntry<float> _rainDropSize;
         private ConfigEntry<float> _rainDensity;
+        private ConfigEntry<bool> _gustsEnabled;
+        private ConfigEntry<float> _gustInterval;
+        private ConfigEntry<float> _gustStrengthScale;
 
         // -------- decor config --------
         private ConfigEntry<bool> _decorDimming;
@@ -190,6 +197,11 @@ namespace OnTogetherDayAndNight
         private ConfigEntry<float> _nightNatureVolume;
         private ConfigEntry<float> _natureFadeSeconds;
         private ConfigEntry<float> _rainNatureMultiplier;
+        private ConfigEntry<float> _leafStepVolume;
+        private ConfigEntry<float> _windVolume;
+        private ConfigEntry<float> _crowVolume;
+        private ConfigEntry<float> _crowCallsPerMinute;
+        private ConfigEntry<bool> _leafStepPuffs;
 
         // -------- in-game config menu --------
         private ConfigEntry<bool> _configMenuEnabled;
@@ -469,6 +481,8 @@ namespace OnTogetherDayAndNight
         // white surface through this filter comes out #FFF4D0, a warm afternoon. Written the way
         // an sRGB literal "looks right" (0.98 blue, say) the filter would be invisible.
         private static readonly Color AutumnWarmFilter = new Color(1.02f, 0.90f, 0.62f, 1f);
+        // Authored sRGB; the moon texture is written through ToSceneColor like everything else.
+        private static readonly Color HarvestMoonColor = new Color(1.00f, 0.78f, 0.42f, 1f);
 
         private sealed class CanopyCluster
         {
@@ -521,8 +535,22 @@ namespace OnTogetherDayAndNight
             public int OriginalCycleCount;
             public float OriginalShapeRadius;
             public bool ShapeAdjusted;
+            public bool OriginalExternalForces;
+            public bool OriginalVelocityEnabled;
+            public ParticleSystemSimulationSpace OriginalVelocitySpace;
+            public ParticleSystem.MinMaxCurve OriginalVelocityX, OriginalVelocityY, OriginalVelocityZ;
+            // The flutter the game's leaves already have. A gust turns it up for its duration
+            // and puts it back afterwards, so a blown leaf tumbles instead of sliding.
+            public bool NoiseCaptured;
+            public bool NoiseBoosted;
+            public bool OriginalNoiseEnabled;
+            public float OriginalNoiseStrength;
+            public float OriginalNoiseFrequency;
             // Copies this plugin made to spread leaf fall over the island; simply destroyed again.
             public bool Cloned;
+            public Vector3 WindVelocity;
+            public float WindSampleAt;
+
         }
 
         private readonly List<SeasonMaterialState> _seasonMaterials = new List<SeasonMaterialState>();
@@ -543,11 +571,78 @@ namespace OnTogetherDayAndNight
         private Material _canopyShadowMaterial;
         private bool[][] _canopyDappleMasks;
         private float _canopyDappleMaskGaps = -1f;
-        private const int CanopyShadowGrid = 16;
+        private const int CanopyShadowGrid = 18;
+        // Grid points are pushed off the lattice by up to this fraction of a cell before the
+        // shell is built. Without it every hole is an axis-aligned rectangle and the dapples
+        // read as pixel art; the cells stay quads, they are just no longer square.
+        private const float CanopyShadowVertexJitter = 0.78f;
         private const int CanopyDapplePatterns = 8;
         private readonly List<LeafEmitterState> _leafEmitters = new List<LeafEmitterState>();
         private Material _autumnLeafMaterial;
         private Texture2D _autumnLeafAtlas;
+        private readonly Material[] _treeLeafMaterials = new Material[4];
+        private readonly Dictionary<GameObject, bool> _lighthouseOriginalActive = new Dictionary<GameObject, bool>();
+        private float _nextLighthouseScan;
+        private float _nextLeafEmitterLight;
+
+        // Walking through the fallen leaves: a few scraps kicked backwards from the feet, and a
+        // dry crunch. Both only fire when there are actually leaves underfoot.
+        private GameObject _leafKickObject;
+        private ParticleSystem _leafKick;
+        private ParticleSystemRenderer _leafKickRenderer;
+        private Vector3 _lastWalkerPosition;
+        private Transform _walkerTransform;
+        private float _nextWalkerLookup;
+        private bool _walkerTracked;
+        private float _nextLeafStepAt;
+
+        private AudioSource _leafStepSource;
+        private AudioSource _windAudioSource;
+        private AudioSource _crowAudioSource;
+        private AudioClip _leafStepClip;
+        private AudioClip _windAudioClip;
+        private readonly List<AudioClip> _crowClips = new List<AudioClip>();
+        private float _crowStopAt;
+        private float _leafStepStopAt;
+        private float _nextCrowAt;
+        private bool _windGenerated;
+        private float[] _windSamples;
+        private int _windReadPosition;
+
+        // Gusts. A gust is a few seconds of wind from one direction, with a long quiet spell
+        // between. Three things move with it: the canopy shader's own wind, a force field the
+        // leaf particles ride, and the leaves already lying on the ground.
+        private sealed class WindMaterial
+        {
+            public Material Material;
+            public float Original;
+            // Amplitude alone does not read as wind. A gust is mostly felt as the canopies
+            // moving faster, so the shader's wind speed is driven too - and the materials
+            // disagree on how to spell it: the canopies use _WindSpeed, the outlines _Windspeed.
+            public string SpeedProperty;
+            public float OriginalSpeed;
+        }
+        private readonly List<WindMaterial> _windMaterials = new List<WindMaterial>();
+        private bool _windCaptured;
+        private float _gustStrength;
+        private float _appliedGustWind = -1f;
+        private float _nextGustAt;
+        private float _scheduledGustInterval = -1f;
+        private float _gustQuietSince;
+        private int _leafEmitterLightCursor;
+        private float _nextLeafLampSnapshot;
+        private struct LeafLampSample
+        {
+            public Vector3 Position, Forward;
+            public Color Radiance;
+            public float Range, SpotEdge;
+        }
+        private readonly List<LeafLampSample> _leafLampSamples = new List<LeafLampSample>();
+        private float _gustEndAt;
+        private Vector3 _gustDirection = Vector3.forward;
+        private GameObject _gustFieldObject;
+        private ParticleSystemForceField _gustField;
+        private bool _leafForcesActive;
 
         // Leaves that have already landed. Kept as plain data and drawn as one mesh of
         // world-space quads: a GameObject per leaf would be hundreds of transforms and draw
@@ -557,19 +652,64 @@ namespace OnTogetherDayAndNight
             public Vector3 Position;
             public Vector3 Right;
             public Vector3 Forward;
+            public Vector3 Normal;
             public int Frame;
             public float BornAt;
+            // Light arriving here, refreshed a slice at a time and carried into the mesh as
+            // vertex colour, so a leaf lying under a lamp is lit and the one next to it is not.
+            public Color Illumination;
+            public float LiftedAt = -1f;
+            public Vector3 Velocity;
+            // How far a gust has carried this leaf from where it landed, how far it has spun on
+            // the way, and how readily it moves at all - a leaf is not a uniform object.
+            public Vector3 Drift;
+            public float Spin;
+            public float DriftFactor;
+            // A leaf on water drifts on its own all the time, rides the swell, and is not blown
+            // away by a gust the way one caught on grass is - it is already floating.
+            public bool OnWater;
+            public float BobPhase;
+            public Vector3 WaterTarget;
+            public float NextWaterStep;
+            // A leaf is its own thing on the water: its own pace, its own line across the
+            // channel, and its own slow turn where there is no current to follow. Without these
+            // every floating leaf simply traces the path of the one in front of it.
+            public float FlowSpeed = 0.6f;
+            public float StepSpeed = 0.6f;
+            public float Lane;
+            public float WanderAngle;
+            public float WanderTurn;
+            // Standing water: which body it is floating on, whether anything is currently
+            // carrying it, and when it goes waterlogged and sinks. Without the last of these a
+            // leaf that reaches a fountain or a closed pool stays there for the rest of the
+            // session, and the still bodies quietly swallow the whole water budget.
+            public int WaterBody = -1;
+            public bool InCurrent;
+            public float StillExpiry = -1f;
+            // Where the stuck check last saw it and since when, for a leaf pressed into a rim.
+            public Vector3 StuckAt;
+            public float StuckSince;
+            public bool InWaterfall;
+            public int WaterfallSegment = -1;
+            public float WaterfallAlong;
+            public float WaterfallOffset;
+            public Transform WaterfallTransform;
         }
         private readonly List<GroundLeaf> _groundLeaves = new List<GroundLeaf>();
         private readonly List<Vector3> _groundLeafVertices = new List<Vector3>();
         private readonly List<Vector2> _groundLeafUvs = new List<Vector2>();
         private readonly List<int> _groundLeafTriangles = new List<int>();
+        private readonly List<Color> _groundLeafColors = new List<Color>();
+        // Which leaves ended up in the mesh, in mesh order, so colours can be refreshed without
+        // rebuilding the geometry.
+        private readonly List<int> _groundLeafDrawn = new List<int>();
+        private float _nextGroundLeafLight;
+        private int _groundLeafLightCursor;
         private GameObject _groundLeafObject;
         private Mesh _groundLeafMesh;
         private MeshRenderer _groundLeafRenderer;
         private Material _groundLeafMaterial;
         private float _nextGroundLeafSpawn;
-        private float _nextGroundLeafRebuild;
         private bool _groundLeafDirty;
         private int _groundLeafRayMask;
         private bool _groundLeafRayMaskReady;
@@ -577,6 +717,44 @@ namespace OnTogetherDayAndNight
         // somewhere else and they build up there too, while the ones behind you stay put.
         private const float GroundLeafViewerRange = 70f;
         private const float GroundLeafFadeSeconds = 3f;
+        // How far off the sampled river centreline a leaf still counts as being in the current.
+        // Beyond it the leaf is on a closed pool or out at sea, where nothing carries it anywhere
+        // and it has no business setting off in the river's direction.
+        private const float RiverLeafReach = 4.5f;
+        // The pool at the head of the waterfall, in the frame's own space. The lip is narrow, so
+        // the leaves have to be funnelled into it as they approach or they arrive spread across
+        // the whole rim and pile up along it.
+        private const float PondLeafHalfWidth = 4f;
+        private const float PondLeafBackEdge = 4f;
+        private const float PondLeafLipZ = -5.78f;
+        private const float PondLeafLipHalfWidth = 0.42f;
+        // Bind the array overload explicitly: Unity's NativeArray conversions require Span support the legacy compiler lacks.
+        private static readonly Func<ParticleSystem, ParticleSystem.Particle[], int, int, int> ReadLeafParticles =
+            (Func<ParticleSystem, ParticleSystem.Particle[], int, int, int>)Delegate.CreateDelegate(
+                typeof(Func<ParticleSystem, ParticleSystem.Particle[], int, int, int>),
+                typeof(ParticleSystem).GetMethod("GetParticles", new Type[] {
+                    typeof(ParticleSystem.Particle[]), typeof(int), typeof(int) }));
+        private static readonly Action<ParticleSystem, ParticleSystem.Particle[], int, int> WriteLeafParticles =
+            (Action<ParticleSystem, ParticleSystem.Particle[], int, int>)Delegate.CreateDelegate(
+                typeof(Action<ParticleSystem, ParticleSystem.Particle[], int, int>),
+                typeof(ParticleSystem).GetMethod("SetParticles", new Type[] {
+                    typeof(ParticleSystem.Particle[]), typeof(int), typeof(int) }));
+        private ParticleSystem.Particle[] _leafLightParticles = new ParticleSystem.Particle[128];
+        private readonly List<MeshCollider> _leafWaterProbes = new List<MeshCollider>();
+        private float _nextLeafWaterScan;
+        private float _nextLeafStatus;
+        private Vector3 _airborneLeafWind;
+        private readonly List<Vector3> _riverLeafRoute = new List<Vector3>();
+        private readonly List<Transform> _pondLeafTransforms = new List<Transform>();
+        // Verified against level2 MD_WaterfallHill / MD_WaterfallHill.002 vertices; only used for that named mesh, in its local space.
+        private static readonly Vector3[] PondLeafRoute = new Vector3[] {
+            new Vector3(0f, 15.62f, 2f), new Vector3(0f, 15.62f, 0f),
+            new Vector3(0f, 15.62f, -2.85f), new Vector3(0f, 15.562f, -5.783f),
+            new Vector3(0f, 15.414f, -6.051f), new Vector3(0f, 15.315f, -6.105f),
+            new Vector3(0f, -1.199f, -8.151f) };
+        private int _waterLeafAttempts, _waterLeafHits, _waterLeafBlocked, _waterLeafSpawned;
+        private readonly List<int> _stillLeafPerBody = new List<int>();
+        private int _stillLeafCount;
         // -1 until a season has been applied once, then 0 summer / 1 autumn.
         private int _appliedSeason = -1;
         private float _nextSeasonRescan;
@@ -1045,13 +1223,18 @@ namespace OnTogetherDayAndNight
             _weatherEnabled = Config.Bind("Weather", "Enabled", true,
                 "Enables Day and Night rain events, visuals and the game's own rain ambience audio.");
             _randomRain = Config.Bind("Weather", "Random rain", true,
-                "Starts and stops rain automatically after randomized clear/rain intervals.");
+                "Starts and stops rain automatically. How often is set by 'Rain chance' below.");
+            _alwaysRain = Config.Bind("Weather", "Always raining", false,
+                "Holds the rain on and stops the random schedule. Stopping the rain by hand - the "
+                + "button in the menu, or the toggle key - clears this as well.");
+            _rainChance = Config.Bind("Weather", "Rain chance", 0.25f,
+                "0.02-0.9. Roughly the share of the time it rains. A shower's own length is set by "
+                + "the two entries below; the clear stretch between showers is worked out from this "
+                + "and them, so 0.25 means about one hour in four is wet. Replaces the pair of "
+                + "'Clear minutes' entries, which said the same thing in a way nobody could read "
+                + "the answer off.");
             _rainToggleKey = Config.Bind("Weather", "Toggle rain key", "F10",
                 "Keyboard key that immediately starts or stops rain. F10 avoids FrameCare's F7-F9 keys.");
-            _clearMinutesMin = Config.Bind("Weather", "Clear minutes minimum", 8f,
-                "Minimum clear-weather time before a random rain event can start.");
-            _clearMinutesMax = Config.Bind("Weather", "Clear minutes maximum", 18f,
-                "Maximum clear-weather time before a random rain event starts.");
             _rainMinutesMin = Config.Bind("Weather", "Rain minutes minimum", 2.5f,
                 "Minimum duration of a random rain event.");
             _rainMinutesMax = Config.Bind("Weather", "Rain minutes maximum", 5.5f,
@@ -1070,6 +1253,18 @@ namespace OnTogetherDayAndNight
                 "Visible size of raindrops (0.4-1.4). This does not change their fall speed.");
             _rainDensity = Config.Bind("Weather", "Rain density multiplier", 1.66f,
                 "Amount of visible rain (0.5-2.0). Higher values may have a small performance cost.");
+
+            _gustsEnabled = Config.Bind("Weather", "Gusts of wind", true,
+                "Every so often a gust crosses the island: the tree canopies lean and sway together, " +
+                "falling leaves are blown sideways, and leaves lying on the ground skitter along and " +
+                "are carried off. Works in both seasons - the canopies sway either way, there are " +
+                "simply no leaves to move in summer.");
+            _gustInterval = Config.Bind("Weather", "Gust interval seconds", 480f,
+                "Average quiet time between gusts. Each one lasts four to nine seconds and comes from " +
+                "a new direction.");
+            _gustStrengthScale = Config.Bind("Weather", "Gust strength", 0.4f,
+                "0-2. How hard a gust blows: how far the canopies lean, how hard the airborne leaves " +
+                "are pushed, and how quickly leaves on the ground are carried away.");
 
             _adjustSun = Config.Bind("Sun", "Adjust sun", true,
                 "The game parks its directional light at a permanent overhead noon (90 degrees, straight down) " +
@@ -1296,13 +1491,18 @@ namespace OnTogetherDayAndNight
             _autumnWarmFilter = Config.Bind("Season", "Warm filter", 0.75f,
                 "0-1. Strength of a warm amber cast over the whole autumn frame. It works on top of " +
                 "the normal colour grade and follows the day cycle, so nights stay cool.");
-            _leafFallRate = Config.Bind("Season", "Leaf fall rate", 4f,
+            _leafFallRate = Config.Bind("Season", "Leaf fall rate", 1.5f,
                 "Multiplier on the falling-leaf emitters in autumn. 1 leaves the game's own three " +
-                "exactly as the game has them.");
-            _leafFallTrees = Config.Bind("Season", "Shedding trees", 40,
+                "exactly as the game has them. Note that the game's leaves are almost weightless - " +
+                "one percent gravity - so they hang in the air for their full ten seconds rather " +
+                "than falling past. Rate multiplies how many are in the air at once, not how fast " +
+                "they go by: at the default this and the setting below put about 240 leaves in the " +
+                "sky across the island, against the game's own 80.");
+            _leafFallTrees = Config.Bind("Season", "Shedding trees", 20,
                 "Autumn only. The game only sheds leaves at three fixed spots on the whole island, so " +
                 "this many tree canopies get an emitter of their own, largest trees first. Each one " +
-                "costs a few dozen more particles; 0 disables it and leaves the game's three.");
+                "holds about six leaves in the air at the default rate; 0 disables it and leaves the " +
+                "game's three.");
             _groundLeafLimit = Config.Bind("Season", "Leaves on the ground", 400,
                 "Autumn only. How many fallen leaves may lie on the ground at once. They build up " +
                 "around wherever you are and stay there. 0 turns the ground layer off. This is the " +
@@ -1311,6 +1511,20 @@ namespace OnTogetherDayAndNight
             _groundLeafLifetime = Config.Bind("Season", "Ground leaf lifetime", 0f,
                 "Seconds a leaf lies on the ground before fading out. 0 means they never fade: the " +
                 "layer fills to the limit above and then stays.");
+            _autumnSunElevation = Config.Bind("Season", "Sun elevation multiplier", 0.76f,
+                "0.4-1. Scales the noon sun height in autumn. The sun sitting lower all day is most " +
+                "of what makes autumn light read as autumn: longer shadows, and everything lit more " +
+                "from the side than from above. 1 keeps the summer arc.");
+            _harvestMoon = Config.Bind("Season", "Harvest moon", true,
+                "Autumn nights get a larger, deep golden moon low over the sea, the way a harvest " +
+                "moon looks.");
+            _leavesOnWater = Config.Bind("Season", "Leaves land on water", true,
+                "Fallen leaves may also settle on the sea and the ponds, where they drift slowly " +
+                "instead of lying still. They count against the same ground-leaf limit.");
+            _autumnWaterTint = Config.Bind("Season", "Water depth tint", 0.5f,
+                "0-1. Pulls the sea and the ponds toward a deeper, colder blue in autumn. The " +
+                "horizon band takes only a third of it: where sea meets sky it has to keep " +
+                "following the sky, or dusk lands on grey.");
             _halloweenStringLights = Config.Bind("Season", "Halloween string lights", true,
                 "Autumn only. Puts the hanging string lights on pumpkin orange, candle amber, witch " +
                 "purple, toxic green and blood red instead of the usual pastel rainbow.");
@@ -1324,6 +1538,21 @@ namespace OnTogetherDayAndNight
             _canopyShadowGaps = Config.Bind("Sun", "Dapple density", 0.42f,
                 "0-1. How much of the perforated canopy is holes. Holes are weighted toward the edge " +
                 "of the crown, so the middle of the shadow stays solid the way a real canopy does.");
+
+            _leafStepVolume = Config.Bind("Nature ambience", "Leaf step volume", 0.32f,
+                "0-1. Volume of the dry-leaf crunch when you walk over fallen leaves in autumn. " +
+                "Needs audio/autumn_leaf_step.ogg (or .wav/.mp3); silent without it.");
+            _windVolume = Config.Bind("Nature ambience", "Wind volume", 0.45f,
+                "0-1. Volume of the wind during a gust; it rises and falls with the gust itself. " +
+                "Needs audio/wind_gust.ogg (or .wav/.mp3); silent without it.");
+            _crowVolume = Config.Bind("Nature ambience", "Crow volume", 0.4f,
+                "0-1. Volume of the occasional crow call that replaces the cicadas in autumn. " +
+                "Needs audio/crow_call.ogg (or .wav/.mp3); silent without it.");
+            _crowCallsPerMinute = Config.Bind("Nature ambience", "Crow calls per minute", 0.7f,
+                "How often a crow calls during an autumn day. 0 turns them off.");
+            _leafStepPuffs = Config.Bind("Season", "Kick up leaves when walking", true,
+                "Walking over fallen leaves in autumn scatters a few scraps of leaf backwards from " +
+                "your feet, which bounce and settle.");
 
             _configMenuEnabled = Config.Bind("Interface", "Enable in-game config menu", true,
                 "Enables the in-game settings menu. Changes are saved and applied automatically.");
@@ -1373,6 +1602,20 @@ namespace OnTogetherDayAndNight
                 changed = true;
             }
 
+            if (_configRevision.Value < 3)
+            {
+                // 1.0.1.5 and 1.0.1.6 shipped 4x rate across 40 trees. Because the game's leaves
+                // are effectively weightless, that is 2240 of them permanently in the air rather
+                // than a heavier fall, and it read as a non-stop gale. Anyone still on those two
+                // values gets the corrected pair; anyone who has tuned their own is left alone.
+                if (Mathf.Abs(_leafFallRate.Value - 4f) < 0.001f)
+                    _leafFallRate.Value = 1.5f;
+                if (_leafFallTrees.Value == 40)
+                    _leafFallTrees.Value = 20;
+                _configRevision.Value = 3;
+                changed = true;
+            }
+
             if (!changed)
                 return;
             Config.Save();
@@ -1392,6 +1635,7 @@ namespace OnTogetherDayAndNight
             RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
             EndNeutralProfilePhotoRender();
             RestoreSky();
+            RestoreLighthouse();
             RestoreAmbient();
             RestoreSun();
             RestoreShadowAntialiasing();
@@ -1407,6 +1651,8 @@ namespace OnTogetherDayAndNight
             RestoreWaterMaterials();
             RestoreDecorMaterials();
             RestoreSeasonTheme();
+            RestoreGusts();
+            DestroyLeafKick();
             RestoreCanopyShadows();
             if (_canopyShadowMaterial != null)
                 Destroy(_canopyShadowMaterial);
@@ -1421,6 +1667,9 @@ namespace OnTogetherDayAndNight
                 Destroy(_starTexture);
             if (_autumnLeafMaterial != null)
                 Destroy(_autumnLeafMaterial);
+            for (int i = 0; i < _treeLeafMaterials.Length; i++)
+                if (_treeLeafMaterials[i] != null)
+                { Destroy(_treeLeafMaterials[i].mainTexture); Destroy(_treeLeafMaterials[i]); }
             if (_autumnLeafAtlas != null)
                 Destroy(_autumnLeafAtlas);
             ClearClouds();
@@ -1458,10 +1707,12 @@ namespace OnTogetherDayAndNight
                 // New chunks bring new canopies and leaf emitters with them.
                 _nextSeasonRescan = now + 1.5f;
                 _seasonRescanAttempts = 0;
+                _nextLighthouseScan = 0f;
                 return;
             }
 
             // Scene loads reset RenderSettings, so previous captures are stale.
+            RestoreLighthouse();
             RestoreShadowAntialiasing();
             RestoreCameraSkyboxes();
             RestoreShadowCasting();
@@ -1494,6 +1745,9 @@ namespace OnTogetherDayAndNight
             _leafEmitters.Clear();
             // The leaves lay on geometry that is going away with the scene.
             DestroyGroundLeaves();
+            DestroyLeafKick();
+            _walkerTracked = false;
+            _walkerTransform = null;
             _appliedSeason = -1;
             _seasonRescanAttempts = 0;
             _nextSeasonRescan = 0f;
@@ -1536,10 +1790,14 @@ namespace OnTogetherDayAndNight
 
             UpdateWeather();
             UpdateDayCycle();
+            UpdateLighthouse();
             RefreshNativeFeatureMaterials();
             UpdateDeviceScreenLights();
             UpdateNatureAmbience();
+            UpdateGusts();
+            UpdateLeafSteps();
             UpdateGroundLeaves();
+            UpdateLeafEmitterLighting();
             UpdateMoonVisual();
             UpdateClouds();
             // Without the day cycle there is no twilight; make sure stale celestial
@@ -1968,24 +2226,12 @@ namespace OnTogetherDayAndNight
                     ? "Runs the day and night cycle using the real-world clock."
                     : "現実の時刻に合わせて昼夜が進行します。";
                 case "白天太阳尺寸": return language == 1 ? "Daytime Sun Size" : "昼の太陽サイズ";
-                case "默认 0.028；日出/日落与白天太阳会在低空阶段平滑交接。": return language == 1
-                    ? "Default: 0.028. The sun keeps a consistent size through dawn and dusk."
-                    : "初期値は 0.028。日の出と日没でも自然な大きさを保ちます。";
                 case "正午太阳高度": return language == 1 ? "Noon Sun Height" : "正午の太陽高度";
                 case "正午太阳的最高高度；数值越高，影子越短。": return language == 1
                     ? "Sets the sun's highest point at noon. Higher values create shorter shadows."
                     : "正午の太陽の最高高度です。高いほど影が短くなります。";
                 case "一轮昼夜分钟数": return language == 1 ? "Day Length (Minutes)" : "1日の長さ（分）";
-                case "现实时间中一整个昼夜循环的长度。": return language == 1
-                    ? "Length of one full day and night cycle in real minutes."
-                    : "昼夜が一周するまでの現実時間（分）です。";
-                case "现实时间中一整个昼夜循环的长度；1440 分钟时与现实一天同步。": return language == 1
-                    ? "Length of one full day and night cycle in real minutes. At 1440 minutes it follows the real day."
-                    : "昼夜が一周するまでの現実時間です。1440分では現実の1日と同期します。";
                 case "雨滴尺寸倍率": return language == 1 ? "Raindrop Size" : "雨粒の大きさ";
-                case "默认 0.72；只改变可见雨滴的尺寸。": return language == 1
-                    ? "Default: 0.72. Changes the visible size of raindrops without changing fall speed."
-                    : "初期値は 0.72。落下速度を変えず、見た目の大きさだけを調整します。";
                 case "雨滴密度倍率": return language == 1 ? "Rain Density" : "雨の密度";
                 case "默认 1.18；数值越高，雨量越大。": return language == 1
                     ? "Default: 1.18. Higher values create heavier rain and may affect performance."
@@ -2032,9 +2278,6 @@ namespace OnTogetherDayAndNight
                     ? "Holds the sky at the time set below. All other features continue to run normally. Turn this off to resume the day and night cycle."
                     : "空を下で設定した時刻に固定します。他の機能は通常どおり動作します。オフにすると昼夜の移り変わりが再開します。";
                 case "固定时刻": return language == 1 ? "Locked Time" : "固定する時刻";
-                case "12 时为正午，0 时与 24 时为午夜，18 时前后为日落，6 时前后为日出。": return language == 1
-                    ? "12 is noon, 0 and 24 are midnight, sunset falls around 18 and sunrise around 6."
-                    : "12 は正午、0 と 24 は真夜中、日没は 18 時前後、日の出は 6 時前後です。";
                 case "指定晚霞颜色": return language == 1 ? "Fixed Sunset Colour" : "夕焼けの色を指定";
                 case "晚霞颜色默认随机。指定后将固定使用该配色：0 随机，1 金橙，2 晨间明黄，3 粉色，4 深红。": return language == 1
                     ? "Sunset colour is random by default. Choosing one here uses it every time: 0 random, 1 golden, 2 morning yellow, 3 pink, 4 deep red."
@@ -2067,30 +2310,13 @@ namespace OnTogetherDayAndNight
                 case "太阳位于地平线附近时海面亮度的下限。过低会使海面先于天空变暗，出现灰蒙的过渡色。": return language == 1
                     ? "Lower limit on sea brightness while the sun is near the horizon. Values that are too low let the sea darken before the sky, producing a grey transition."
                     : "太陽が地平線付近にあるときの海面の明るさの下限です。低すぎると空より先に海が暗くなり、灰色がかった中間色になります。";
-                case "夜间水面亮度": return language == 1 ? "Night Water Brightness" : "夜の水面の明るさ";
-                case "控制深夜海水主体的亮度。": return language == 1 ? "Controls the main sea color at deep night." : "深夜の海面全体の明るさを調整します。";
-                case "水波纹亮度": return language == 1 ? "Water Pattern Brightness" : "水面模様の明るさ";
-                case "控制海面、喷泉和瀑布的浅色纹路；不会再跟随深色水体变黑。": return language == 1
-                    ? "Controls the light patterns on the sea, fountains, and waterfalls without inheriting dark water colors."
-                    : "海、噴水、滝の明るい模様を調整します。暗い水面の色を引き継いで黒くなることはありません。";
-                case "白天水波纹颜色": return language == 1 ? "Day Water Pattern Color" : "昼の水面模様の色";
-                case "夜间水波纹颜色": return language == 1 ? "Night Water Pattern Color" : "夜の水面模様の色";
-                case "白天使用的水纹颜色；昼夜交替时会自动平滑过渡。": return language == 1
-                    ? "Water-pattern color used in daylight. It blends smoothly during dawn and dusk."
-                    : "昼に使う水面模様の色です。朝夕は滑らかに切り替わります。";
-                case "深夜使用的水纹颜色；可一边观察水面一边实时调整。": return language == 1
-                    ? "Water-pattern color used at deep night. Adjust it live while viewing the water."
-                    : "深夜に使う水面模様の色です。水面を見ながらリアルタイムで調整できます。";
                 case "红": return language == 1 ? "Red" : "赤";
                 case "绿": return language == 1 ? "Green" : "緑";
                 case "蓝": return language == 1 ? "Blue" : "青";
-                case "夜间瀑布水花亮度": return language == 1 ? "Night Waterfall Spray" : "夜の滝しぶきの明るさ";
-                case "单独控制瀑布顶部和底部的水花亮度。": return language == 1 ? "Separately controls spray and foam at the top and bottom of waterfalls." : "滝の上部と下部にある水しぶきの明るさを個別に調整します。";
                 case "降雨": return language == 1 ? "Rain" : "雨";
                 case "启用昼夜天气": return language == 1 ? "Enable Day and Night Weather" : "昼夜の天気を有効化";
                 case "总开关；关闭会平滑结束当前雨天。": return language == 1 ? "Master switch. Turning it off gently clears the current rain." : "天気機能の主スイッチです。オフにすると現在の雨が自然に止みます。";
                 case "随机下雨": return language == 1 ? "Random Rain" : "ランダムな雨";
-                case "按配置的晴天/雨天区间自动切换。": return language == 1 ? "Automatically alternates between configured clear and rainy periods." : "設定した晴天・雨天の時間に合わせて自動で切り替えます。";
                 case "默认 0.72；只改变雨滴大小，不改变落速。": return language == 1 ? "Default: 0.72. Changes raindrop size without changing fall speed." : "初期値は 0.72。落下速度を変えず、雨粒の大きさだけを調整します。";
                 case "天气过渡秒数": return language == 1 ? "Weather Transition (Seconds)" : "天気の切替時間（秒）";
                 case "风暴形成与散去的渐变时间。": return language == 1 ? "Time used for storms to build up and clear away." : "雨雲が広がり、また晴れるまでの移行時間です。";
@@ -2131,18 +2357,11 @@ namespace OnTogetherDayAndNight
                 case "场景阴影亮度": return language == 1 ? "World Shadow Brightness" : "風景の影の明るさ";
                 case "越低越暗；1 接近原版不明显的阴影。": return language == 1 ? "Lower values make shadows darker; 1 is close to the original appearance." : "低いほど影が暗くなり、1 で元の見た目に近づきます。";
                 case "人物阴影亮度": return language == 1 ? "Character Shadow Brightness" : "キャラクターの影の明るさ";
-                case "单独控制人物，避免面部变成黑块。": return language == 1 ? "Controls characters separately to keep faces readable." : "顔が暗くなりすぎないよう、キャラクターだけを個別に調整します。";
                 case "环境光冷色偏移": return language == 1 ? "Cooler Ambient Light" : "環境光の寒色補正";
                 case "让阴影区域略偏蓝灰。": return language == 1 ? "Gives shaded areas a subtle blue-grey tone." : "影の部分をわずかに青灰色へ寄せます。";
                 case "环境光强度": return language == 1 ? "Ambient Light Strength" : "環境光の強さ";
                 case "控制填充阴影的整体环境光。": return language == 1 ? "Controls the ambient light that fills shaded areas." : "影を照らす環境光全体の強さを調整します。";
-                case "控制阴影在水面上的可见程度；不会影响水波、泡沫或反射。其余水面细节沿用推荐值。 ": return language == 1
-                    ? "Controls how visible shadows are on water without changing waves, foam, or reflections. Other water details use the recommended values."
-                    : "波、泡、反射を変えず、水面上の影の見え方だけを調整します。その他の水面設定は推奨値を使います。";
                 case "水面接收阴影": return language == 1 ? "Shadows on Water" : "水面に影を落とす";
-                case "在原水面上加一层透明的真实主光阴影接收层；不会改动波纹、泡沫或反射材质。": return language == 1
-                    ? "Adds a transparent layer that receives real sun shadows without changing the original waves, foam, or reflection material."
-                    : "元の波、泡、反射マテリアルを変えずに、太陽の影だけを受ける透明レイヤーを水面に追加します。";
                 case "水面阴影浓度": return language == 1 ? "Water Shadow Depth" : "水面の影の濃さ";
                 case "启用场景灯光": return language == 1 ? "Enable Scene Lights" : "シーン照明を有効化";
                 case "启用路灯、灯笼和吊灯串的夜间局部照明。": return language == 1
@@ -2156,14 +2375,6 @@ namespace OnTogetherDayAndNight
                 case "给工具店甲板的原版吊灯串添加彩色渐变照明和光晕。": return language == 1
                     ? "Adds softly changing colored light and glow to the original string bulbs on the tool-shop deck."
                     : "工具店デッキにある元の電球飾りへ、ゆっくり色が変わる照明と光を追加します。";
-                case "篝火全天照明": return language == 1 ? "Campfire Lighting All Day" : "焚き火を一日中照らす";
-                case "篝火白天保持低亮度，夜间自动增强；火焰本体也会自发光，并始终占用两个本地光源名额。": return language == 1
-                    ? "Keeps campfires faintly lit by day and brighter at night. The flame also glows, and two nearby-light slots are always reserved."
-                    : "昼は控えめ、夜は明るく焚き火を照らします。炎も光り、近くのライト枠を常に2つ確保します。";
-                case "游乐塔太阳灯": return language == 1 ? "Play-Tower Sun Lamp" : "遊具タワーの太陽ランプ";
-                case "为原版太阳挂饰添加暖黄色夜间照明。": return language == 1
-                    ? "Adds warm yellow nighttime lighting to the original sun ornament."
-                    : "元の太陽の飾りに、暖かな黄色の夜間照明を追加します。";
                 case "路灯照明范围": return language == 1 ? "Street-Light Range" : "街灯の照明範囲";
                 case "普通路灯与场景灯的影响半径。较大的数值会明显增加光照范围。": return language == 1
                     ? "The radius of ordinary street and scene lights. Larger values noticeably widen their coverage."
@@ -2189,10 +2400,6 @@ namespace OnTogetherDayAndNight
                     ? "Brightness of the player-desk and library-table lamps at deep night."
                     : "プレイヤーの机と図書館のテーブルライトの深夜の明るさです。";
                 case "夜间灯光": return language == 1 ? "Night Lighting" : "夜の照明";
-                case "藤编挂灯暖白照明": return language == 1 ? "Warm Woven Hanging Lamps" : "編み込み吊りランプの暖色照明";
-                case "照亮大树下和餐厅旁的藤编小挂灯；不会影响秋千、座椅或彩灯串。": return language == 1
-                    ? "Lights the small woven lamps below the large tree and beside the canteen; swings, seats, and string bulbs are untouched."
-                    : "大きな木の下と食堂横の小さな編み込み吊りランプだけを照らします。ブランコ、座席、電球の飾りは変わりません。";
                 case "手机、笔记本与游戏机屏幕微光": return language == 1 ? "Device Screen Glow" : "端末画面の微光";
                 case "让手机、笔记本和手持游戏机的屏幕保持轻微可见；游戏机画面会缓慢变色并偶尔跳变。": return language == 1
                     ? "Keeps phone, laptop, and handheld-console screens faintly visible; the console shifts colour with occasional game-like jumps."
@@ -2241,16 +2448,6 @@ namespace OnTogetherDayAndNight
                     return language == 1
                     ? "How far the autumn palette is mixed over the summer colours. 1 is the full repaint; lower values keep some green for an early-autumn look."
                     : "秋の配色を夏の色にどれだけ重ねるかです。1 で完全に塗り替え、低くすると緑が残り初秋のようになります。";
-                case "树冠暗面亮度": return language == 1 ? "Canopy Shade Brightness" : "樹冠の陰の明るさ";
-                case "球型树冠背光面的亮度，与其他物件的阴影亮度滑块是同一种手感。1 接近没有暗面；调低会同时加深每片树冠的下半部、底部的暗带，以及同一棵树上下层树冠之间的明暗差。":
-                    return language == 1
-                    ? "How light the shaded side of a round canopy is, the same way the other shade sliders work. 1 is almost no shading; lower deepens the underside of each disc, the band beneath it, and the difference between the upper and lower discs of one tree."
-                    : "丸い樹冠の影側の明るさです。他の陰影スライダーと同じ感覚で使えます。1 でほぼ陰影なし、下げるほど各樹冠の下側・その下の帯・同じ木の上下の樹冠の明暗差が濃くなります。";
-                case "树冠明暗层次": return language == 1 ? "Canopy Shading" : "樹冠の陰影";
-                case "球型树冠所用的着色器本身没有光照，它的明暗全部来自底部的暗带和每片树冠内部的上下渐变。0 会让树冠变成一整块平色；过高则树冠整体偏暗。":
-                    return language == 1
-                    ? "The shader these round canopies use has no lighting of its own, so all of their light and shade comes from the dark band along the underside and the ramp inside each disc. 0 makes them one flat block of colour; too high and the crowns go dark."
-                    : "丸い樹冠のシェーダーには照明がないため、陰影はすべて下側の暗い帯と、各樹冠内部のグラデーションから来ています。0 では真っ平らな色になり、上げすぎると樹冠全体が暗くなります。";
                 case "树影斑驳": return language == 1 ? "Dappled Tree Shadows" : "木漏れ日の影";
                 case "球型树冠的影子原本是一整块实心的椭圆。开启后改由一个带孔洞的树冠形状来投影，影子里会出现细碎的光斑。":
                     return language == 1
@@ -2265,10 +2462,6 @@ namespace OnTogetherDayAndNight
                 case "给整个画面叠加的暖琥珀色调。夜间会自动淡出，不影响夜晚的冷色。": return language == 1
                     ? "A warm amber cast over the whole frame. It fades out at night, so nights keep their cool tone."
                     : "画面全体に暖かい琥珀色をかけます。夜は自動的に弱まるので、夜の寒色はそのままです。";
-                case "包含草坪与小路": return language == 1 ? "Include lawn and paths" : "芝生と小道も含める";
-                case "让草坪和岛上的小路一起换成秋季配色。关闭则只改变植被。": return language == 1
-                    ? "Repaints the island lawn and the paths crossing it as well. Turn this off to change only the planting."
-                    : "島の芝生とその小道も秋の色に塗り替えます。オフにすると植物だけが変わります。";
                 case "落叶": return language == 1 ? "Falling Leaves" : "落ち葉";
                 case "落叶频率倍率": return language == 1 ? "Leaf Fall Rate" : "落ち葉の量";
                 case "落叶发射器的倍率。1 表示原版自带的三处与原版完全一致。": return language == 1
@@ -2288,11 +2481,59 @@ namespace OnTogetherDayAndNight
                 case "地面落叶在消失前停留的秒数。0 表示永不消失：堆到上限后就一直留着。": return language == 1
                     ? "Seconds a fallen leaf lies on the ground before fading. 0 means they never fade: the layer fills to the limit and stays."
                     : "落ち葉が消えるまで地面に残る秒数です。0 なら消えません。上限まで積もったあとはそのまま残ります。";
+                case "阵风": return language == 1 ? "Gusts" : "突風";
+                case "启用阵风": return language == 1 ? "Gusts of wind" : "突風を有効にする";
+                case "每隔一段时间会有一阵风扫过全岛：树冠一起倾斜摇摆，飘落的树叶被吹得横飞，地上的落叶会打着转被卷走。夏季同样生效，只是没有落叶可吹。":
+                    return language == 1
+                    ? "Every so often a gust crosses the island: the canopies lean and sway together, falling leaves are blown sideways, and leaves on the ground skitter along and are carried off. Works in summer too - there are simply no leaves to move."
+                    : "ときどき島を突風が吹き抜けます。樹冠がそろって傾いて揺れ、落ち葉は横に流され、地面の葉は回りながら運び去られます。夏でも効果はありますが、動かす葉がないだけです。";
+                case "阵风间隔秒数": return language == 1 ? "Gust Interval" : "突風の間隔";
+                case "两阵风之间的平均间隔。每阵风持续四到九秒，风向随机。": return language == 1
+                    ? "Average quiet time between gusts. Each lasts four to nine seconds and comes from a new direction."
+                    : "突風と突風の間の平均的な静けさの長さです。1 回は 4〜9 秒続き、風向きは毎回変わります。";
+                case "阵风强度": return language == 1 ? "Gust Strength" : "突風の強さ";
+                case "风有多大：树冠倾斜的幅度、空中落叶被推的力度，以及地面落叶被卷走的速度。": return language == 1
+                    ? "How hard a gust blows: how far the canopies lean, how hard the airborne leaves are pushed, and how quickly leaves on the ground are carried away."
+                    : "風の強さです。樹冠の傾き、空中の落ち葉が押される強さ、地面の葉が運ばれる速さに影響します。";
+                case "风声音量": return language == 1 ? "Wind Volume" : "風の音量";
+                case "阵风的风声音量，随风的强弱起伏。需要 audio 目录下的 wind_gust 音频文件。": return language == 1
+                    ? "Volume of the wind during a gust, rising and falling with it. Needs a wind_gust audio file in the audio folder."
+                    : "突風のときの風の音量です。風の強弱に合わせて上下します。audio フォルダーに wind_gust の音声ファイルが必要です。";
+                case "踩落叶音量": return language == 1 ? "Leaf Step Volume" : "落ち葉を踏む音量";
+                case "秋季走在落叶上时的踩踏声。需要 audio 目录下的 autumn_leaf_step 音频文件。": return language == 1
+                    ? "The crunch of walking over fallen leaves in autumn. Needs an autumn_leaf_step audio file in the audio folder."
+                    : "秋に落ち葉の上を歩くときの音です。audio フォルダーに autumn_leaf_step の音声ファイルが必要です。";
+                case "乌鸦叫声音量": return language == 1 ? "Crow Volume" : "カラスの音量";
+                case "秋季白天偶尔响起的乌鸦叫声，取代夏季的蝉鸣。需要 audio 目录下的 crow_call 音频文件。":
+                    return language == 1
+                    ? "The occasional crow through an autumn day, in place of the summer cicadas. Needs a crow_call audio file in the audio folder."
+                    : "秋の日中にときどき鳴くカラスの声で、夏の蝉に代わるものです。audio フォルダーに crow_call の音声ファイルが必要です。";
+                case "乌鸦叫声频率": return language == 1 ? "Crow Calls per Minute" : "カラスの鳴く頻度";
+                case "秋季白天每分钟平均响起几声乌鸦叫。0 表示关闭。": return language == 1
+                    ? "Average crow calls per minute through an autumn day. 0 turns them off."
+                    : "秋の日中に 1 分あたり平均何回カラスが鳴くかです。0 で無効になります。";
                 case "彩灯": return language == 1 ? "String Lights" : "電飾";
                 case "万圣节彩灯配色": return language == 1 ? "Halloween string lights" : "ハロウィンの電飾";
                 case "把吊灯串在南瓜橙和女巫紫之间切换，而不是原本的柔和彩虹色。": return language == 1
                     ? "Steps the hanging string lights between pumpkin orange and witch purple instead of the usual pastel rainbow."
                     : "吊り下げ電飾を、いつものパステルの虹色ではなくカボチャのオレンジと魔女の紫で切り替えます。";
+                case "一直下雨": return language == 1 ? "Always Raining" : "ずっと雨";
+                case "保持一直下雨，不再自动放晴。用下面的按钮或 F10 手动停止下雨时，这个开关也会一起关掉。": return language == 1
+                    ? "Holds the rain on and stops it clearing by itself. Stopping the rain by hand - the button below, or F10 - turns this off as well."
+                    : "雨を降らせ続け、自動で晴れないようにします。下のボタンか F10 で手動で雨を止めると、この設定も一緒にオフになります。";
+                case "按下面的雨天概率自动开始和结束雨天。": return language == 1
+                    ? "Starts and stops rain by itself, at the rain chance set below."
+                    : "下の降雨確率にしたがって、自動で雨を降らせたり止めたりします。";
+                case "雨天概率": return language == 1 ? "Rain Chance" : "降雨確率";
+                case "大致有多少时间在下雨。0.25 表示四分之一的时间是雨天。一场雨本身的长短仍由配置文件决定；两场雨之间要晴多久则由这里算出来。": return language == 1
+                    ? "Roughly how much of the time it rains. 0.25 means about one hour in four is wet. How long a shower itself lasts is still set in the config file; how long it stays clear between them is worked out from this."
+                    : "どれくらいの割合で雨が降るか。0.25 なら 4 時間に 1 時間ほどが雨です。一回の雨の長さは設定ファイルのままで、雨と雨の間の晴れの長さはここから計算されます。";
+                case "现实时间中一整个昼夜循环的长度，以 30 分钟为一档；1440 分钟时与现实一天同步。": return language == 1
+                    ? "Length of one full day-night cycle in real time, in steps of 30 minutes. At 1440 it matches a real day."
+                    : "現実時間での昼夜サイクル一周の長さ。30 分刻みで、1440 分なら現実の一日と同じになります。";
+                case "以半小时为一档。12:00 为正午，00:00 与 24:00 为午夜，18:00 前后为日落，06:00 前后为日出。": return language == 1
+                    ? "In half-hour steps. 12:00 is midday, 00:00 and 24:00 are midnight, around 18:00 is sunset and around 06:00 is sunrise."
+                    : "30 分刻みです。12:00 が正午、00:00 と 24:00 が真夜中、18:00 ごろが日没、06:00 ごろが日の出です。";
                 case "人物接收投影强度": return language == 1 ? "Shadows Cast on Characters" : "キャラに落ちる影の強さ";
                 case "只作用于角色：越低，落在人物身上的投影越明显。": return language == 1
                     ? "Characters only: lower makes shadows falling onto them more obvious."
@@ -2307,13 +2548,13 @@ namespace OnTogetherDayAndNight
             MenuToggle(_replaceSkybox, "启用昼夜天空", "关闭后恢复原版天空；F5 也可快速对比。");
             MenuToggle(_gradingEnabled, "启用色彩校正", "控制白平衡、曝光、对比度和阴影色调。");
             MenuToggle(_dayCycleEnabled, "启用真实时钟昼夜循环", "保持当前按现实时间推进的昼夜循环。");
-            MenuSlider(_cycleMinutes, "一轮昼夜分钟数", 5f, 1440f, 0,
-                "现实时间中一整个昼夜循环的长度；1440 分钟时与现实一天同步。");
+            MenuStepSlider(_cycleMinutes, "一轮昼夜分钟数", 30f, 1440f, 30f, false,
+                "现实时间中一整个昼夜循环的长度，以 30 分钟为一档；1440 分钟时与现实一天同步。");
             MenuSection("时间固定");
             MenuToggle(_freezeTime, "固定当前时刻",
                 "将天色固定在下方设定的时刻，其余功能照常运行。关闭后恢复正常的昼夜交替。");
-            MenuSlider(_frozenHour, "固定时刻", 0f, 24f, 1,
-                "12 时为正午，0 时与 24 时为午夜，18 时前后为日落，6 时前后为日出。");
+            MenuStepSlider(_frozenHour, "固定时刻", 0f, 24f, 0.5f, true,
+                "以半小时为一档。12:00 为正午，00:00 与 24:00 为午夜，18:00 前后为日落，06:00 前后为日出。");
             MenuIntSlider(_twilightVariantOverride, "指定晚霞颜色", 0, 4,
                 "晚霞颜色默认随机。指定后将固定使用该配色：0 随机，1 金橙，2 晨间明黄，3 粉色，4 深红。");
             GUILayout.Space(8f);
@@ -2342,16 +2583,8 @@ namespace OnTogetherDayAndNight
             MenuSection("秋季配色");
             MenuSlider(_autumnStrength, "秋色浓度", 0f, 1f, 2,
                 "秋季配色与原版配色的混合程度。1 为完全换色，较低的数值会保留一些绿意，像初秋。");
-            MenuSlider(_canopyShadeBrightness, "树冠暗面亮度", 0.3f, 1f, 2,
-                "球型树冠背光面的亮度，与其他物件的阴影亮度滑块是同一种手感。1 接近没有暗面；" +
-                "调低会同时加深每片树冠的下半部、底部的暗带，以及同一棵树上下层树冠之间的明暗差。");
-            MenuSlider(_canopyShading, "树冠明暗层次", 0f, 1f, 2,
-                "球型树冠所用的着色器本身没有光照，它的明暗全部来自底部的暗带和每片树冠内部的上下渐变。" +
-                "0 会让树冠变成一整块平色；过高则树冠整体偏暗。");
             MenuSlider(_autumnWarmFilter, "暖色滤镜强度", 0f, 1f, 2,
                 "给整个画面叠加的暖琥珀色调。夜间会自动淡出，不影响夜晚的冷色。");
-            MenuToggle(_autumnGroundRecolor, "包含草坪与小路",
-                "让草坪和岛上的小路一起换成秋季配色。关闭则只改变植被。");
 
             MenuSection("落叶");
             MenuSlider(_leafFallRate, "落叶频率倍率", 0f, 20f, 1,
@@ -2450,10 +2683,6 @@ namespace OnTogetherDayAndNight
                 "玩家书桌和图书馆桌面台灯的影响半径。");
             MenuSlider(_deskLampIntensity, "书桌台灯照明亮度", 0f, 3f, 2,
                 "玩家书桌和图书馆桌面台灯在深夜的亮度。");
-            MenuToggle(_campfireLightsEnabled, "篝火全天照明", "篝火白天保持低亮度，夜间自动增强；火焰本体也会自发光，并始终占用两个本地光源名额。");
-            MenuToggle(_treeLanternLightsEnabled, "藤编挂灯暖白照明",
-                "照亮大树下和餐厅旁的藤编小挂灯；不会影响秋千、座椅或彩灯串。");
-            MenuToggle(_playTowerSunLightEnabled, "游乐塔太阳灯", "为原版太阳挂饰添加暖黄色夜间照明。");
             MenuToggle(_deviceScreensGlow, "手机、笔记本与游戏机屏幕微光",
                 "让手机、笔记本和手持游戏机的屏幕保持轻微可见；游戏机画面会缓慢变色并偶尔跳变。");
         }
@@ -2462,7 +2691,12 @@ namespace OnTogetherDayAndNight
         {
             MenuSection("降雨");
             MenuToggle(_weatherEnabled, "启用昼夜天气", "总开关；关闭会平滑结束当前雨天。");
-            MenuToggle(_randomRain, "随机下雨", "按配置的晴天/雨天区间自动切换。");
+            MenuToggle(_alwaysRain, "一直下雨",
+                "保持一直下雨，不再自动放晴。用下面的按钮或 F10 手动停止下雨时，这个开关也会一起关掉。");
+            MenuToggle(_randomRain, "随机下雨", "按下面的雨天概率自动开始和结束雨天。");
+            MenuSlider(_rainChance, "雨天概率", 0.02f, 0.9f, 2,
+                "大致有多少时间在下雨。0.25 表示四分之一的时间是雨天。一场雨本身的长短仍由配置文件决定；" +
+                "两场雨之间要晴多久则由这里算出来。");
             MenuSlider(_rainDropSize, "雨滴尺寸倍率", 0.4f, 1.4f, 2,
                 "默认 0.72；只改变雨滴大小，不改变落速。");
             MenuSlider(_rainDensity, "雨滴密度倍率", 0.5f, 2f, 2,
@@ -2474,6 +2708,15 @@ namespace OnTogetherDayAndNight
             MenuSlider(_thunderChancePerMinute, "每分钟雷声概率", 0f, 1f, 2, "短闪电与雷声的平均触发概率。");
             if (GUILayout.Button(MenuText(_rainTarget ? "立即停止下雨" : "立即开始下雨"), GUILayout.Height(30f)))
                 SetRainTarget(!_rainTarget, true);
+
+            MenuSection("阵风");
+            MenuToggle(_gustsEnabled, "启用阵风",
+                "每隔一段时间会有一阵风扫过全岛：树冠一起倾斜摇摆，飘落的树叶被吹得横飞，" +
+                "地上的落叶会打着转被卷走。夏季同样生效，只是没有落叶可吹。");
+            MenuSlider(_gustInterval, "阵风间隔秒数", 10f, 1800f, 0,
+                "两阵风之间的平均间隔。每阵风持续四到九秒，风向随机。");
+            MenuSlider(_gustStrengthScale, "阵风强度", 0f, 2f, 2,
+                "风有多大：树冠倾斜的幅度、空中落叶被推的力度，以及地面落叶被卷走的速度。");
 
             MenuSection("云");
             MenuToggle(_cloudsEnabled, "启用昼夜云", "插件生成并随风移动的卡通云。");
@@ -2487,6 +2730,14 @@ namespace OnTogetherDayAndNight
             MenuToggle(_natureAmbienceEnabled, "启用自然环境音", "让蝉鸣和夜间虫鸣随昼夜平滑出现；下雨时会自动降低。 ");
             MenuSlider(_noonCicadaVolume, "正午蝉鸣音量", 0f, 1f, 3, "仅在接近正午时渐入，避免持续干扰。 ");
             MenuSlider(_nightNatureVolume, "夜间虫鸣音量", 0f, 1f, 3, "夜深后渐入；与蝉鸣独立控制。 ");
+            MenuSlider(_windVolume, "风声音量", 0f, 1f, 2,
+                "阵风的风声音量，随风的强弱起伏。需要 audio 目录下的 wind_gust 音频文件。");
+            MenuSlider(_leafStepVolume, "踩落叶音量", 0f, 1f, 2,
+                "秋季走在落叶上时的踩踏声。需要 audio 目录下的 autumn_leaf_step 音频文件。");
+            MenuSlider(_crowVolume, "乌鸦叫声音量", 0f, 1f, 2,
+                "秋季白天偶尔响起的乌鸦叫声，取代夏季的蝉鸣。需要 audio 目录下的 crow_call 音频文件。");
+            MenuSlider(_crowCallsPerMinute, "乌鸦叫声频率", 0f, 5f, 2,
+                "秋季白天每分钟平均响起几声乌鸦叫。0 表示关闭。");
         }
 
         private void DrawGradingConfigTab()
@@ -2545,6 +2796,33 @@ namespace OnTogetherDayAndNight
                 QueueHotConfigApply();
             }
             GUILayout.Label(MenuText(note), _menuNoteStyle);
+        }
+
+        // Snaps to a step instead of to a number of decimal places: a time of day that can only
+        // be a whole or a half hour, a cycle length that can only be a whole number of half hours.
+        private void MenuStepSlider(ConfigEntry<float> entry, string label, float minimum,
+            float maximum, float step, bool asClock, string note)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(MenuText(label), GUILayout.Width(250f));
+            float next = GUILayout.HorizontalSlider(entry.Value, minimum, maximum, GUILayout.MinWidth(220f));
+            next = Mathf.Clamp(Mathf.Round(next / step) * step, minimum, maximum);
+            GUILayout.Label(asClock ? ClockText(next) : next.ToString("F0"),
+                _menuValueStyle, GUILayout.Width(64f));
+            GUILayout.EndHorizontal();
+            if (Mathf.Abs(next - entry.Value) > 0.0001f)
+            {
+                entry.Value = next;
+                QueueHotConfigApply();
+            }
+            GUILayout.Label(MenuText(note), _menuNoteStyle);
+        }
+
+        // 18.5 is not a time of day anybody reads at a glance. 18:30 is.
+        private static string ClockText(float hours)
+        {
+            int total = Mathf.RoundToInt(hours * 60f);
+            return (total / 60).ToString("00") + ":" + (total % 60).ToString("00");
         }
 
         private void MenuIntSlider(ConfigEntry<int> entry, string label, int minimum, int maximum, string note)
@@ -2659,6 +2937,11 @@ namespace OnTogetherDayAndNight
             UniversalAdditionalCameraData data = camera.GetComponent<UniversalAdditionalCameraData>();
             if (data != null)
                 ApplyShadowAntialiasing(camera, data);
+            if (data != null && IsTransparentDesktopMode())
+            {
+                data.renderPostProcessing = false;
+                return;
+            }
             if (data != null && !data.renderPostProcessing)
             {
                 data.renderPostProcessing = true;
@@ -2700,7 +2983,13 @@ namespace OnTogetherDayAndNight
             // A global volume otherwise grades transparent sticker/overlay cameras and the
             // persistent ID-photo capture. Enable it only for the actual world camera.
             if (_volume != null)
-                _volume.enabled = _gradingEnabled.Value && isMainCamera;
+                _volume.enabled = _gradingEnabled.Value && isMainCamera && !IsTransparentDesktopMode();
+
+            if (IsTransparentDesktopMode() && !isProfilePhotoCamera)
+            {
+                UniversalAdditionalCameraData transparentData = camera.GetComponent<UniversalAdditionalCameraData>();
+                if (transparentData != null) transparentData.renderPostProcessing = false;
+            }
 
             if (isProfilePhotoCamera)
                 BeginNeutralProfilePhotoRender(camera);
@@ -2955,6 +3244,12 @@ namespace OnTogetherDayAndNight
             UniversalAdditionalCameraData data = camera.GetComponent<UniversalAdditionalCameraData>();
             if (data == null)
                 return;
+            if (IsTransparentDesktopMode())
+            {
+                data.renderPostProcessing = false;
+                RestoreShadowAntialiasing();
+                return;
+            }
             ApplyShadowAntialiasing(camera, data);
             if (!data.renderPostProcessing)
             {
@@ -2984,9 +3279,47 @@ namespace OnTogetherDayAndNight
             }
         }
 
+        private static bool IsTransparentDesktopMode()
+        {
+            OverlayManager overlay = MonoSingleton<OverlayManager>.I;
+            return overlay != null && overlay.ResolutionMode == ResolutionMode.Desk;
+        }
+
+        private void UpdateLighthouse()
+        {
+            if (!_worldSceneReady) return;
+            if (Time.unscaledTime >= _nextLighthouseScan)
+            {
+                _nextLighthouseScan = Time.unscaledTime + 10f;
+                Transform[] transforms = UnityEngine.Object.FindObjectsByType<Transform>(
+                    FindObjectsInactive.Include, FindObjectsSortMode.None);
+                for (int i = 0; i < transforms.Length; i++)
+                {
+                    GameObject candidate = transforms[i].gameObject;
+                    // Native rotating beam, not the lighthouse building or its seating areas.
+                    if (candidate.name != "MD_Lighthouse_Light" ||
+                        !HasAncestorNamed(transforms[i], "PR_LightHouse") ||
+                        _lighthouseOriginalActive.ContainsKey(candidate)) continue;
+                    _lighthouseOriginalActive.Add(candidate, candidate.activeSelf);
+                    Logger.LogInfo("LIGHTHOUSE native rotating beam registered: " + candidate.name);
+                }
+            }
+            bool enabled = _rainBlend > 0.1f || _lastDayWeight < 0.5f;
+            foreach (KeyValuePair<GameObject, bool> state in _lighthouseOriginalActive)
+                if (state.Key != null && state.Key.activeSelf != enabled) state.Key.SetActive(enabled);
+        }
+
+        private void RestoreLighthouse()
+        {
+            foreach (KeyValuePair<GameObject, bool> state in _lighthouseOriginalActive)
+                if (state.Key != null) state.Key.SetActive(state.Value);
+            _lighthouseOriginalActive.Clear();
+            _nextLighthouseScan = 0f;
+        }
+
         private void ApplyShadowAntialiasing(Camera camera, UniversalAdditionalCameraData data)
         {
-            if (!_stabilizeShadowEdges.Value || !_adjustSun.Value)
+            if (IsTransparentDesktopMode() || !_stabilizeShadowEdges.Value || !_adjustSun.Value)
             {
                 RestoreShadowAntialiasing();
                 return;
@@ -3179,7 +3512,7 @@ namespace OnTogetherDayAndNight
                 phase = Mathf.Repeat((Mathf.Clamp(_frozenHour.Value, 0f, 24f) - 12f) / 24f, 1f);
             _lastCyclePhase = phase;
 
-            float maxElevation = Mathf.Clamp(_maxElevation.Value, 20f, 80f);
+            float maxElevation = Mathf.Clamp(_maxElevation.Value, 20f, 80f) * AutumnSunScale();
             float signedElevation = maxElevation * Mathf.Cos(phase * 2f * Mathf.PI);
             // Smooth |elevation| with a floor so the light never grazes the horizon exactly.
             float elevation = Mathf.Sqrt(signedElevation * signedElevation + 36f);
@@ -3404,7 +3737,8 @@ namespace OnTogetherDayAndNight
                             // is deliberately fast: past a fifth of the twilight it is nearly all
                             // sky, and the only near-neutral moment left is a bright daytime haze.
                             Color target = skyMirror * (0.96f * Mathf.Lerp(0.45f, 1f, propBrightness));
-                            driven = Color.Lerp(driven, target, horizonMirror);
+                            driven = Color.Lerp(driven, target,
+                                water.IsOpenWater ? horizonMirror : horizonMirror * 0.2f);
                         }
                         else
                         {
@@ -3424,6 +3758,11 @@ namespace OnTogetherDayAndNight
                                     waterTwilight);
                             }
                         }
+                        // A vertical sheet has no distant horizon: apply the full autumn body
+                        // treatment instead of diluting it with the sea's grazing-angle sky.
+                        driven = ApplyAutumnWaterTint(driven, water.IsWaterfall ? 0f : weight);
+                        if (water.IsWaterfall && _appliedSeason == 1)
+                            driven *= Mathf.Lerp(1f, 0.78f, Mathf.Clamp01(_autumnWaterTint.Value));
                         driven.a = original.a;
                         drivenColors[j] = driven;
                         // The shadow-receiver overlay matches this so a lit surface barely
@@ -4810,6 +5149,28 @@ namespace OnTogetherDayAndNight
             return sky;
         }
 
+        // Autumn water: colder and deeper, but only on the body channels. The horizon band is
+        // where the sea meets the sky and has to keep chasing it - a saturated blue mixed halfway
+        // into a warm dusk sky is grey, which is exactly the failure this sea was tuned out of.
+        private Color ApplyAutumnWaterTint(Color color, float weight)
+        {
+            if (_appliedSeason != 1)
+                return color;
+            float amount = Mathf.Clamp01(_autumnWaterTint.Value);
+            if (amount <= 0.001f)
+                return color;
+            if (weight > 0.9f)
+                amount *= 0.33f;
+            float hue, saturation, value;
+            Color.RGBToHSV(color, out hue, out saturation, out value);
+            if (value < 0.002f)
+                return color;
+            Color target = Color.HSVToRGB(0.605f,
+                Mathf.Clamp01(Mathf.Max(saturation, 0.55f) * 1.12f), value * 0.88f);
+            target.a = color.a;
+            return Color.Lerp(color, target, amount);
+        }
+
         private static float ColorLuminance(Color color)
         {
             return color.r * 0.2126f + color.g * 0.7152f + color.b * 0.0722f;
@@ -4906,6 +5267,8 @@ namespace OnTogetherDayAndNight
             Color multiplier = Color.Lerp(new Color(0.68f, 0.78f, 0.95f, 1f), Color.white, dayWeight);
             multiplier *= brightness;
             multiplier = ApplyLuminancePreservingTint(multiplier, _twilightGlowColor, twilight * 0.45f);
+            if (_appliedSeason == 1)
+                multiplier = Color.Lerp(multiplier, ApplyAutumnWaterTint(multiplier, 0f), 0.35f);
             for (int i = _waterParticles.Count - 1; i >= 0; i--)
             {
                 WaterParticleState state = _waterParticles[i];
@@ -5027,7 +5390,8 @@ namespace OnTogetherDayAndNight
                 overlayRenderer.receiveShadows = true;
                 overlayRenderer.lightProbeUsage = LightProbeUsage.Off;
                 overlayRenderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
-                overlayRenderer.sortingOrder = 20;
+                // Keep water below later transparent leaves and halos. Depth still occludes land.
+                overlayRenderer.sortingOrder = 0;
 
                 _waterShadowOverlayObjects.Add(overlay);
                 _waterShadowOverlaySourceIds.Add(sourceId);
@@ -5063,6 +5427,7 @@ namespace OnTogetherDayAndNight
             material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
             material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
             material.DisableKeyword("_RECEIVE_SHADOWS_OFF");
+            PreserveDestinationAlpha(material);
             _waterShadowOverlayMaterial = material;
             UpdateWaterShadowOverlayMaterial(_lastDayWeight);
             return true;
@@ -5169,6 +5534,16 @@ namespace OnTogetherDayAndNight
             if (amount <= 0.001f)
                 return Color.white;
             return Color.Lerp(Color.white, AutumnWarmFilter, amount);
+        }
+
+        // Autumn's sun never climbs as high. Applied to the configured noon elevation rather
+        // than to the live angle, so the whole arc scales and dawn and dusk still land where the
+        // clock says they should.
+        private float AutumnSunScale()
+        {
+            if (_appliedSeason != 1)
+                return 1f;
+            return Mathf.Clamp(_autumnSunElevation.Value, 0.4f, 1f);
         }
 
         private bool IsAutumnTheme()
@@ -5771,10 +6146,7 @@ namespace OnTogetherDayAndNight
             _canopyShadowMaterial = new Material(donor);
             _canopyShadowMaterial.name = "LookCare Canopy Shadow";
             _canopyShadowMaterial.enableInstancing = false;
-            // The canopy shader animates its vertices in the wind. The stand-in is a different
-            // mesh, so it would sway out of step with the tree it belongs to.
-            if (_canopyShadowMaterial.HasProperty("_WindStrength"))
-                _canopyShadowMaterial.SetFloat("_WindStrength", 0f);
+            // Retain the native canopy wind shader; update its parameters with the donor below.
             if (_canopyShadowMaterial.HasProperty("_CastShadows"))
                 _canopyShadowMaterial.SetFloat("_CastShadows", 1f);
             // A single-sided shell must not be culled away when its winding faces from the light.
@@ -5829,12 +6201,20 @@ namespace OnTogetherDayAndNight
                 Matrix4x4 matrix = discs[d];
                 Bounds discBounds = bounds[d];
                 int baseIndex = vertices.Count;
+                int jitterSeed = patterns[d] % _canopyDappleMasks.Length;
                 for (int z = 0; z <= grid; z++)
                 {
                     for (int x = 0; x <= grid; x++)
                     {
-                        float nx = ((float)x / grid) * 2f - 1f;
-                        float nz = ((float)z / grid) * 2f - 1f;
+                        // Shared between the cells that meet at this point, so the shell stays
+                        // closed; it is the lattice that moves, not each cell independently.
+                        int vertex = z * stride + x;
+                        float jx = (DiscJitter(jitterSeed, vertex) - 0.5f) *
+                            2f * CanopyShadowVertexJitter / grid;
+                        float jz = (DiscJitter(jitterSeed + 977, vertex) - 0.5f) *
+                            2f * CanopyShadowVertexJitter / grid;
+                        float nx = ((float)x / grid) * 2f - 1f + jx;
+                        float nz = ((float)z / grid) * 2f - 1f + jz;
                         float flat = nx * nx + nz * nz;
                         float ny = flat < 1f ? Mathf.Sqrt(1f - flat) : 0f;
                         Vector3 unit = new Vector3(nx, ny, nz);
@@ -6012,7 +6392,15 @@ namespace OnTogetherDayAndNight
         // two ginkgo fans in gold and butter, two maple leaves in orange and scarlet, each with
         // its colour baked into the atlas so the shape and the colour cannot come apart.
         private const int LeafTileSize = 128;
-        private const float ClonedLeafBaseRate = 1.2f;
+        // The vanilla leaf particles have gravityModifier 0.01 - one percent of gravity - and
+        // no velocity or force module at all: they drift on a noise field and fall about five
+        // metres in their ten-second life. They are, in effect, close to weightless. So the
+        // emission rate is not "leaves per second falling past"; it is "leaves permanently
+        // hanging in the air", and the whole island's worth is on screen at once. The game ships
+        // three emitters totalling about 80 airborne leaves. At the 1.2 base rate this used, 40
+        // trees put 2240 in the air, none of which ever landed - which does not look like autumn,
+        // it looks like a permanent gale.
+        private const float ClonedLeafBaseRate = 0.4f;
         private static readonly float[] MapleLobeAngles =
             new float[] { 0f, 0.95f, -0.95f, 2.30f, -2.30f };
         private static readonly float[] MapleLobeLengths =
@@ -6143,10 +6531,11 @@ namespace OnTogetherDayAndNight
                 return false;
             if (_autumnLeafAtlas == null)
                 _autumnLeafAtlas = CreateAutumnLeafAtlas();
-            // Cloned from the game's own leaf material so the blend mode, render queue and
-            // shader variant are ones this build definitely has, rather than a shader looked up
-            // by name that may have been stripped.
-            _autumnLeafMaterial = new Material(source);
+            // Sprite shader consumes particle/mesh vertex colours and the atlas alpha.
+            Shader shader = Shader.Find("Sprites/Default");
+            if (shader == null) return false;
+            _autumnLeafMaterial = new Material(shader);
+            _autumnLeafMaterial.renderQueue = 3200;
             _autumnLeafMaterial.name = "LookCare Autumn Leaves";
             if (_autumnLeafMaterial.HasProperty("_BaseMap"))
                 _autumnLeafMaterial.SetTexture("_BaseMap", _autumnLeafAtlas);
@@ -6192,6 +6581,20 @@ namespace OnTogetherDayAndNight
             // at 1, 2 and 5 leaves a second, and a copy that picked up the 5 would put a couple
             // of hundred particles under every tree it was placed on. A copy is one tree quietly
             // shedding, so it gets its own modest base rate and the user's multiplier on top.
+
+            ParticleSystem.ExternalForcesModule external = system.externalForces;
+            state.OriginalExternalForces = external.enabled;
+            external.multiplier = 1f;
+            // Left exactly as the game has it - off - until a gust actually blows. The vanilla
+            // emitters deliberately have external forces disabled, and leaving them on outside a
+            // gust means the leaves are no longer behaving the way the game authored them.
+            external.enabled = false;
+            ParticleSystem.VelocityOverLifetimeModule velocity = system.velocityOverLifetime;
+            state.OriginalVelocityEnabled = velocity.enabled;
+            state.OriginalVelocitySpace = velocity.space;
+            state.OriginalVelocityX = velocity.x;
+            state.OriginalVelocityY = velocity.y;
+            state.OriginalVelocityZ = velocity.z;
             emission.rateOverTimeMultiplier = (cloned ? ClonedLeafBaseRate : state.OriginalRate) * rate;
             if (shapeRadius > 0f)
             {
@@ -6207,14 +6610,524 @@ namespace OnTogetherDayAndNight
             // species and colour as it fell. One tree drops one kind of leaf.
             sheet.frameOverTime = new ParticleSystem.MinMaxCurve(0f);
             int clamped = Mathf.Clamp(frame, 0, LeafTileColors.Length - 1);
-            sheet.startFrame = new ParticleSystem.MinMaxCurve(clamped, clamped + 0.999f);
+            sheet.startFrame = new ParticleSystem.MinMaxCurve((float)clamped);
             sheet.cycleCount = 1;
-            renderer.sharedMaterial = _autumnLeafMaterial;
+            // A single tile avoids inherited particle UV streams and random sheet offsets.
+            // Both this tile and ground quads reference exactly the same atlas pixels.
+            sheet.enabled = false;
+            if (_treeLeafMaterials[clamped] == null)
+            {
+                Texture2D tile = new Texture2D(LeafTileSize, LeafTileSize, TextureFormat.RGBA32, false);
+                tile.SetPixels(_autumnLeafAtlas.GetPixels((clamped % 2) * LeafTileSize,
+                    clamped < 2 ? LeafTileSize : 0, LeafTileSize, LeafTileSize));
+                tile.wrapMode = TextureWrapMode.Clamp;
+                tile.Apply(false);
+                Material material = new Material(_autumnLeafMaterial);
+                material.mainTexture = tile;
+                _treeLeafMaterials[clamped] = material;
+            }
+            renderer.sharedMaterial = _treeLeafMaterials[clamped];
         }
 
         // ---------------------------------------------------------------
         // Leaves that have landed
         // ---------------------------------------------------------------
+        // ---------------------------------------------------------------
+        // Gusts
+        // ---------------------------------------------------------------
+        // A crow every so often through an autumn day, in place of the cicadas.
+        private void UpdateCrowCalls(float worldWeight)
+        {
+            if (_crowStopAt > 0f && Time.unscaledTime >= _crowStopAt)
+            {
+                _crowStopAt = 0f;
+                if (_crowAudioSource != null)
+                    _crowAudioSource.Stop();
+            }
+            if (_crowAudioSource == null || _crowClips.Count == 0 || _appliedSeason != 1 ||
+                worldWeight <= 0.001f)
+                return;
+            float now = Time.unscaledTime;
+            if (now < _nextCrowAt)
+                return;
+            float perMinute = Mathf.Clamp(_crowCallsPerMinute.Value, 0f, 20f);
+            if (perMinute <= 0.001f)
+            {
+                _nextCrowAt = now + 30f;
+                return;
+            }
+            // Spread around the configured rate rather than on a metronome.
+            _nextCrowAt = now + (60f / perMinute) * UnityEngine.Random.Range(0.45f, 1.7f);
+            // Crows are a daytime sound; they go quiet after dark.
+            if (_lastDayWeight < 0.12f)
+                return;
+            float volume = Mathf.Clamp01(_crowVolume.Value) * Mathf.Clamp01(_lastDayWeight);
+            if (volume <= 0.005f)
+                return;
+            AudioClip clip = _crowClips[UnityEngine.Random.Range(0, _crowClips.Count)];
+            if (clip == null)
+                return;
+            _crowAudioSource.pitch = UnityEngine.Random.Range(0.92f, 1.09f);
+            if (clip.length > 6f)
+            {
+                // A long woodland recording rather than a single call: take a couple of seconds
+                // from somewhere in it, so it is a few birds heard in passing and never the same
+                // stretch twice.
+                const float window = 2.6f;
+                float latest = Mathf.Max(0f, clip.length - window - 0.1f);
+                _crowAudioSource.clip = clip;
+                _crowAudioSource.time = latest > 0.01f ? UnityEngine.Random.Range(0f, latest) : 0f;
+                _crowAudioSource.volume = volume;
+                _crowAudioSource.Play();
+                _crowStopAt = Time.unscaledTime + window;
+                return;
+            }
+            _crowAudioSource.PlayOneShot(clip, volume);
+        }
+
+        // Walking through the fallen leaves. Both the scraps and the crunch are gated on there
+        // actually being leaves underfoot, so crossing bare ground is silent.
+        private void UpdateLeafSteps()
+        {
+            if (_leafStepStopAt > 0f && Time.unscaledTime >= _leafStepStopAt)
+            {
+                _leafStepStopAt = 0f;
+                if (_leafStepSource != null)
+                    _leafStepSource.Stop();
+            }
+            if (_appliedSeason != 1 || !_worldSceneReady || _groundLeaves.Count == 0)
+                return;
+
+            // MonoSingleton<T>.I runs a scene-wide search every time it is read while the
+            // instance is null, so the result is cached and only re-looked-up occasionally.
+            if (_walkerTransform == null)
+            {
+                if (Time.unscaledTime < _nextWalkerLookup)
+                    return;
+                _nextWalkerLookup = Time.unscaledTime + 2f;
+                FollowScript follow = MonoSingleton<FollowScript>.I;
+                _walkerTransform = follow != null ? follow.FollowTarget : null;
+                if (_walkerTransform == null)
+                {
+                    _walkerTracked = false;
+                    return;
+                }
+            }
+            Vector3 position = _walkerTransform.position;
+            if (!_walkerTracked)
+            {
+                _walkerTracked = true;
+                _lastWalkerPosition = position;
+                return;
+            }
+            Vector3 travel = position - _lastWalkerPosition;
+            travel.y = 0f;
+            float delta = Mathf.Max(0.0001f, Time.deltaTime);
+            float speed = travel.magnitude / delta;
+            _lastWalkerPosition = position;
+
+            float now = Time.unscaledTime;
+            if (speed < 1.1f || now < _nextLeafStepAt)
+                return;
+            // Roughly a pace apart, and quicker when running.
+            _nextLeafStepAt = now + Mathf.Clamp(0.62f / Mathf.Max(0.5f, speed / 2.6f), 0.22f, 0.6f);
+
+            if (!IsStandingInLeaves(position))
+                return;
+
+            Vector3 forward = travel.sqrMagnitude > 0.0001f ? travel.normalized : _walkerTransform.forward;
+            EmitLeafKick(position, forward);
+            PlayLeafStep();
+        }
+
+        private bool IsStandingInLeaves(Vector3 position)
+        {
+            const float reachSquared = 1.6f * 1.6f;
+            for (int i = 0; i < _groundLeaves.Count; i++)
+            {
+                GroundLeaf leaf = _groundLeaves[i];
+                if (leaf.OnWater || leaf.LiftedAt >= 0f)
+                    continue;
+                Vector3 spot = leaf.Position + leaf.Drift;
+                float dx = spot.x - position.x;
+                float dz = spot.z - position.z;
+                if (dx * dx + dz * dz > reachSquared)
+                    continue;
+                if (Mathf.Abs(spot.y - position.y) < 1.6f)
+                    return true;
+            }
+            return false;
+        }
+
+        // Two or three scraps thrown back from the feet, with enough lift to arc and land.
+        private void EmitLeafKick(Vector3 position, Vector3 forward)
+        {
+            if (!_leafStepPuffs.Value || _autumnLeafMaterial == null)
+                return;
+            EnsureLeafKick();
+            if (_leafKick == null)
+                return;
+
+            Vector3 back = -forward;
+            Vector3 side = Vector3.Cross(Vector3.up, forward).normalized;
+            int count = UnityEngine.Random.Range(2, 4);
+            for (int i = 0; i < count; i++)
+            {
+                ParticleSystem.EmitParams parameters = new ParticleSystem.EmitParams();
+                // Offset left and right of centre, so the scraps come off both feet rather than
+                // out of one point in the middle of the character.
+                float lateral = (i % 2 == 0 ? 1f : -1f) * UnityEngine.Random.Range(0.08f, 0.2f);
+                parameters.position = position + side * lateral + Vector3.up * 0.06f;
+                parameters.velocity =
+                    back * UnityEngine.Random.Range(0.8f, 1.7f) +
+                    Vector3.up * UnityEngine.Random.Range(1.3f, 2.3f) +
+                    side * UnityEngine.Random.Range(-0.45f, 0.45f);
+                parameters.startSize = UnityEngine.Random.Range(0.042f, 0.082f);
+                parameters.startLifetime = UnityEngine.Random.Range(0.7f, 1.25f);
+                parameters.rotation = UnityEngine.Random.Range(0f, 360f);
+                parameters.angularVelocity = UnityEngine.Random.Range(-320f, 320f);
+                _leafKick.Emit(parameters, 1);
+            }
+
+        }
+
+        private void EnsureLeafKick()
+        {
+            if (_leafKickObject != null || _autumnLeafMaterial == null || _autumnLeafAtlas == null)
+                return;
+            _leafKickObject = new GameObject("LookCare Leaf Kick");
+            _leafKick = _leafKickObject.AddComponent<ParticleSystem>();
+
+            ParticleSystem.MainModule main = _leafKick.main;
+            main.loop = true;
+            main.playOnAwake = false;
+            main.maxParticles = 96;
+            // Emitted by hand at the player's feet, in world space so a scrap stays where it was
+            // thrown instead of being dragged along by the character.
+            main.simulationSpace = ParticleSystemSimulationSpace.World;
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0f);
+            main.startSize = new ParticleSystem.MinMaxCurve(0.06f);
+            main.startLifetime = new ParticleSystem.MinMaxCurve(1f);
+            // Enough to arc over and drop rather than float away.
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(1.35f);
+
+            ParticleSystem.EmissionModule emission = _leafKick.emission;
+            emission.enabled = false;
+            ParticleSystem.ShapeModule shape = _leafKick.shape;
+            shape.enabled = false;
+
+            ParticleSystem.TextureSheetAnimationModule sheet = _leafKick.textureSheetAnimation;
+            sheet.enabled = true;
+            sheet.mode = ParticleSystemAnimationMode.Grid;
+            sheet.numTilesX = 2;
+            sheet.numTilesY = 2;
+            sheet.animation = ParticleSystemAnimationType.WholeSheet;
+            sheet.frameOverTime = new ParticleSystem.MinMaxCurve(0f);
+            sheet.startFrame = new ParticleSystem.MinMaxCurve(0f, 3.999f);
+            sheet.cycleCount = 1;
+
+            _leafKickRenderer = _leafKickObject.GetComponent<ParticleSystemRenderer>();
+            if (_leafKickRenderer != null)
+            {
+                _leafKickRenderer.sharedMaterial = _autumnLeafMaterial;
+                _leafKickRenderer.renderMode = ParticleSystemRenderMode.Billboard;
+                _leafKickRenderer.shadowCastingMode = ShadowCastingMode.Off;
+                _leafKickRenderer.receiveShadows = false;
+            }
+            _leafKick.Play();
+        }
+
+        // The clip is a continuous recording of walking through leaves, so each step plays a
+        // short window from a random point in it - every footfall lands on different material.
+        private void PlayLeafStep()
+        {
+            if (_leafStepSource == null || _leafStepClip == null)
+                return;
+            float volume = Mathf.Clamp01(_leafStepVolume.Value);
+            if (volume <= 0.005f)
+                return;
+            const float window = 0.34f;
+            float latest = Mathf.Max(0f, _leafStepClip.length - window - 0.05f);
+            _leafStepSource.clip = _leafStepClip;
+            _leafStepSource.time = latest > 0.01f ? UnityEngine.Random.Range(0f, latest) : 0f;
+            _leafStepSource.pitch = UnityEngine.Random.Range(0.9f, 1.12f);
+            _leafStepSource.volume = volume;
+            _leafStepSource.Play();
+            _leafStepStopAt = Time.unscaledTime + window;
+        }
+
+        private void DestroyLeafKick()
+        {
+            if (_leafKickObject != null)
+                Destroy(_leafKickObject);
+            _leafKickObject = null;
+            _leafKick = null;
+            _leafKickRenderer = null;
+        }
+
+        private void UpdateGusts()
+        {
+            bool enabled = _gustsEnabled != null && _gustsEnabled.Value;
+            // Unscaled, like every other clock in this plugin: the game scales time in places,
+            // and a gust that stalls mid-blow never ends.
+            float now = Time.unscaledTime;
+            float requestedInterval = Mathf.Clamp(_gustInterval.Value, 10f, 1800f);
+            if (!enabled || !_worldSceneReady)
+            {
+                _nextGustAt = 0f;
+                _scheduledGustInterval = -1f;
+                _gustEndAt = 0f;
+            }
+            else if (_nextGustAt <= 0f)
+            {
+                _gustQuietSince = now;
+                _nextGustAt = now + Mathf.Min(requestedInterval, 30f);
+                _scheduledGustInterval = requestedInterval;
+                Logger.LogInfo("GUST first due in " + (_nextGustAt - now).ToString("F1") + "s");
+            }
+            else if (Mathf.Abs(requestedInterval - _scheduledGustInterval) > 0.01f)
+            {
+                _nextGustAt = Mathf.Max(now, _gustQuietSince + requestedInterval);
+                _scheduledGustInterval = requestedInterval;
+                Logger.LogInfo("GUST rescheduled in " + (_nextGustAt - now).ToString("F1") + "s");
+            }
+            if (enabled && _worldSceneReady && now >= _nextGustAt && now >= _gustEndAt)
+            {
+                float interval = Mathf.Clamp(_gustInterval.Value, 10f, 1800f);
+                _gustEndAt = now + UnityEngine.Random.Range(4f, 9f);
+                _gustQuietSince = _gustEndAt;
+                _nextGustAt = _gustEndAt + UnityEngine.Random.Range(interval * 0.85f, interval * 1.15f);
+                float angle = UnityEngine.Random.value * Mathf.PI * 2f;
+                _gustDirection = new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle));
+                Logger.LogInfo("GUST from " + _gustDirection + " for " +
+                    (_gustEndAt - now).ToString("F1") + "s");
+            }
+
+            // Ease into a gentle gust, then leave a longer settling tail.
+            float target = enabled && now < _gustEndAt ? 1f : 0f;
+            float rate = Time.unscaledDeltaTime / (target > _gustStrength ? 1.4f : 3.5f);
+            _gustStrength = Mathf.MoveTowards(_gustStrength, target, rate);
+
+            ApplyGustToCanopies();
+            ApplyGustField();
+            ApplyGustToLeafEmitters();
+        }
+
+        // The canopy shader animates its own vertices from _WindStrength, so a gust is simply
+        // that value going up across every material that has it - the canopies, the palms and
+        // their outlines together, which matters: an outline that does not sway with the canopy
+        // it outlines comes away from it.
+        private void ApplyGustToCanopies()
+        {
+            if (_canopyShadowMaterial != null && _seasonCanopies.Count > 0 &&
+                _seasonCanopies[0].Batch != null)
+            {
+                Material donor = _seasonCanopies[0].Batch.ToonInstanceMat;
+                string[] windProperties = { "_WindStrength", "_WindSpeed", "_Windspeed" };
+                for (int p = 0; donor != null && p < windProperties.Length; p++)
+                    if (donor.HasProperty(windProperties[p]))
+                        _canopyShadowMaterial.SetFloat(windProperties[p], donor.GetFloat(windProperties[p]));
+            }
+            if (!_windCaptured)
+            {
+                _windCaptured = true;
+                Material[] loaded = Resources.FindObjectsOfTypeAll<Material>();
+                for (int i = 0; i < loaded.Length; i++)
+                {
+                    Material material = loaded[i];
+                    if (material == null || material == _canopyShadowMaterial || !material.HasProperty("_WindStrength"))
+                        continue;
+                    WindMaterial entry = new WindMaterial();
+                    entry.Material = material;
+                    entry.Original = material.GetFloat("_WindStrength");
+                    if (material.HasProperty("_WindSpeed"))
+                    {
+                        entry.SpeedProperty = "_WindSpeed";
+                        entry.OriginalSpeed = material.GetFloat("_WindSpeed");
+                    }
+                    else if (material.HasProperty("_Windspeed"))
+                    {
+                        entry.SpeedProperty = "_Windspeed";
+                        entry.OriginalSpeed = material.GetFloat("_Windspeed");
+                    }
+                    _windMaterials.Add(entry);
+                }
+                Logger.LogInfo("GUST wind materials tracked: " + _windMaterials.Count);
+            }
+            if (_windMaterials.Count == 0)
+                return;
+
+            float gust = _gustStrength * Mathf.Clamp(_gustStrengthScale.Value, 0f, 2f);
+            float scale = 1f + gust * 1.6f;
+            // The canopies already sway a little all the time at the game's own settings, so a
+            // gust that only widens that sway is not distinguishable from the resting state. It
+            // is the speed going up that reads as wind rather than as a bigger idle animation.
+            float speedScale = 1f + gust * 0.8f;
+            if (Mathf.Abs(scale - _appliedGustWind) < 0.01f)
+                return;
+            _appliedGustWind = scale;
+            for (int i = 0; i < _windMaterials.Count; i++)
+            {
+                WindMaterial entry = _windMaterials[i];
+                if (entry.Material == null)
+                    continue;
+                entry.Material.SetFloat("_WindStrength", entry.Original * scale);
+                if (entry.SpeedProperty != null)
+                    entry.Material.SetFloat(entry.SpeedProperty, entry.OriginalSpeed * speedScale);
+            }
+        }
+
+        // One force field, parked on the camera and large enough to cover everything drawn, that
+        // every leaf emitter has been opted into. Cheaper and far simpler than reaching into each
+        // particle system's velocity module, and it leaves their authored motion intact.
+        private void ApplyGustField()
+        {
+            if (_gustStrength <= 0.001f && _gustField == null)
+                return;
+            Camera camera = _worldCamera != null ? _worldCamera : Camera.main;
+            if (camera == null)
+                return;
+            if (_gustFieldObject == null)
+            {
+                _gustFieldObject = new GameObject("LookCare Gust Field");
+                _gustField = _gustFieldObject.AddComponent<ParticleSystemForceField>();
+                _gustField.shape = ParticleSystemForceFieldShape.Box;
+                _gustField.endRange = 400f;
+            }
+            _gustFieldObject.transform.position = camera.transform.position;
+            // This is an acceleration, not a speed: at the 2.2 it used to run at, five seconds of
+            // gust put a leaf past 10 m/s while the ones on the ground were being rolled along at
+            // three. The push is modest now and there is drag under it, so it settles at a
+            // terminal speed of about force/drag instead of climbing for the whole gust. The
+            // steady push comes from the emitters' own velocity module; this is the turbulence.
+            float force = _gustStrength * Mathf.Clamp(_gustStrengthScale.Value, 0f, 2f) * 0.9f;
+            _gustField.drag = 0.55f;
+            _gustField.directionX = new ParticleSystem.MinMaxCurve(_gustDirection.x * force);
+            _gustField.directionZ = new ParticleSystem.MinMaxCurve(_gustDirection.z * force);
+            // A little lift, so leaves are picked up rather than only shoved sideways - and not
+            // the same lift for every one of them, or the whole crown rises as a sheet.
+            _gustField.directionY = new ParticleSystem.MinMaxCurve(force * 0.1f, force * 0.45f);
+        }
+
+        // Opt the leaf emitters into the force field only while a gust is blowing, then put
+        // them back. Between gusts the leaves drift on the game's own noise field, untouched.
+        private void ApplyGustToLeafEmitters()
+        {
+            bool wanted = _gustStrength > 0.01f;
+            bool starting = wanted && !_leafForcesActive;
+            _leafForcesActive = wanted;
+            float scale = Mathf.Clamp(_gustStrengthScale.Value, 0f, 2f);
+            float gust = _gustStrength * scale;
+            // Matched to the speed a leaf lifted off the ground is carried at, below. These are
+            // the same wind: an airborne leaf outrunning the ones being rolled along under it
+            // put the two in different worlds.
+            float speed = gust * 2.4f;
+            Camera camera = _worldCamera != null ? _worldCamera : Camera.main;
+            for (int i = 0; i < _leafEmitters.Count; i++)
+            {
+                LeafEmitterState state = _leafEmitters[i];
+                if (state == null || state.System == null)
+                    continue;
+                // The force field carries the lift and the turbulence, and it adds to whatever
+                // the emitter is already doing rather than replacing it.
+                ParticleSystem.ExternalForcesModule external = state.System.externalForces;
+                external.enabled = wanted;
+                ParticleSystem.VelocityOverLifetimeModule velocity = state.System.velocityOverLifetime;
+                velocity.enabled = wanted || state.OriginalVelocityEnabled;
+                velocity.space = wanted ? ParticleSystemSimulationSpace.World : state.OriginalVelocitySpace;
+                if (wanted)
+                {
+                    // Two constants rather than one: every leaf in a gust travelling at exactly
+                    // the same speed in exactly the same direction is the single thing that
+                    // reads as a conveyor belt instead of as wind. Each particle draws its own
+                    // rate out of this range once and keeps it for the rest of its flight.
+                    // Kept narrow on purpose. Unity draws each axis of this module from its own
+                    // random value, so a wide range does not spread the speeds - it swings the
+                    // heading, and a half-to-one-and-a-half range turned the gust direction by
+                    // up to twenty-five degrees per leaf. They were not blowing the same way.
+                    velocity.x = new ParticleSystem.MinMaxCurve(_gustDirection.x * speed * 0.82f,
+                        _gustDirection.x * speed * 1.22f);
+                    velocity.z = new ParticleSystem.MinMaxCurve(_gustDirection.z * speed * 0.82f,
+                        _gustDirection.z * speed * 1.22f);
+                    // Some are carried up over the crown, some are pushed down past the branch
+                    // they came off - a gust does not sort leaves by height.
+                    velocity.y = new ParticleSystem.MinMaxCurve(speed * -0.08f, speed * 0.3f);
+                }
+                else
+                {
+                    velocity.x = state.OriginalVelocityX;
+                    velocity.y = state.OriginalVelocityY;
+                    velocity.z = state.OriginalVelocityZ;
+                }
+                ApplyGustNoise(state, wanted, gust);
+                // A gust arrives as a gust: it tears a handful of leaves off the crown at once
+                // instead of only nudging whatever happened to already be on its way down. This
+                // is most of what there is to see in the air when the wind gets up.
+                if (!starting || camera == null)
+                    continue;
+                Vector3 at = state.System.transform.position;
+                if ((at - camera.transform.position).sqrMagnitude >
+                    GroundLeafViewerRange * GroundLeafViewerRange * 2.25f)
+                    continue;
+                int burst = Mathf.RoundToInt(UnityEngine.Random.Range(5f, 12f) * scale);
+                if (burst > 0)
+                    state.System.Emit(burst);
+            }
+        }
+
+        // The game's leaves flutter on a noise field. Turning that up for the length of a gust is
+        // what keeps a blown leaf tumbling along a wandering line instead of a straight one, and
+        // it is put back untouched the moment the gust dies.
+        private void ApplyGustNoise(LeafEmitterState state, bool wanted, float gust)
+        {
+            ParticleSystem.NoiseModule noise = state.System.noise;
+            if (!state.NoiseCaptured)
+            {
+                state.NoiseCaptured = true;
+                state.OriginalNoiseEnabled = noise.enabled;
+                state.OriginalNoiseStrength = noise.strengthMultiplier;
+                state.OriginalNoiseFrequency = noise.frequency;
+            }
+            if (wanted)
+            {
+                state.NoiseBoosted = true;
+                noise.enabled = true;
+                noise.strengthMultiplier = Mathf.Max(state.OriginalNoiseStrength, 0.3f) * (1f + gust * 1f);
+                noise.frequency = Mathf.Max(state.OriginalNoiseFrequency, 0.2f) * (1f + gust * 0.45f);
+            }
+            else if (state.NoiseBoosted)
+            {
+                state.NoiseBoosted = false;
+                noise.enabled = state.OriginalNoiseEnabled;
+                noise.strengthMultiplier = state.OriginalNoiseStrength;
+                noise.frequency = state.OriginalNoiseFrequency;
+            }
+        }
+
+        private void RestoreGusts()
+        {
+            for (int i = 0; i < _windMaterials.Count; i++)
+            {
+                WindMaterial entry = _windMaterials[i];
+                if (entry.Material == null)
+                    continue;
+                entry.Material.SetFloat("_WindStrength", entry.Original);
+                if (entry.SpeedProperty != null)
+                    entry.Material.SetFloat(entry.SpeedProperty, entry.OriginalSpeed);
+            }
+            _windMaterials.Clear();
+            _windCaptured = false;
+            _appliedGustWind = -1f;
+            _gustStrength = 0f;
+            _nextGustAt = 0f;
+            _gustEndAt = 0f;
+            _leafForcesActive = false;
+            if (_gustFieldObject != null)
+                Destroy(_gustFieldObject);
+            _gustFieldObject = null;
+            _gustField = null;
+        }
+
         private void UpdateGroundLeaves()
         {
             int limit = _groundLeafLimit != null ? Mathf.Clamp(_groundLeafLimit.Value, 0, 2000) : 0;
@@ -6227,6 +7140,19 @@ namespace OnTogetherDayAndNight
 
             float now = Time.unscaledTime;
             float lifetime = Mathf.Clamp(_groundLeafLifetime.Value, 0f, 3600f);
+            if (now >= _nextLeafStatus)
+            {
+                _nextLeafStatus = now + 30f;
+                int floating = 0;
+                for (int i = 0; i < _groundLeaves.Count; i++)
+                    if (_groundLeaves[i].OnWater) floating++;
+                Logger.LogInfo("LEAF status total=" + _groundLeaves.Count + " water=" + floating +
+                    " still=" + _stillLeafCount +
+                    " surfaces=" + _leafWaterProbes.Count + " attempts/hits/blocked/spawned=" +
+                    _waterLeafAttempts + "/" + _waterLeafHits + "/" + _waterLeafBlocked + "/" + _waterLeafSpawned +
+                    " gustIn=" + Mathf.Max(0f, _nextGustAt - now).ToString("F1"));
+                _waterLeafAttempts = _waterLeafHits = _waterLeafBlocked = _waterLeafSpawned = 0;
+            }
 
             if (lifetime > 0f)
             {
@@ -6246,44 +7172,110 @@ namespace OnTogetherDayAndNight
                 _groundLeafDirty = true;
             }
 
-            if (now >= _nextGroundLeafSpawn && _groundLeaves.Count < limit)
+            // Keep the original quad, size and atlas frame throughout lift-off and flight.
+            float dt = Mathf.Min(Time.deltaTime, 0.1f);
+            float wind = _gustStrength * Mathf.Clamp(_gustStrengthScale.Value, 0f, 2f);
+            for (int i = _groundLeaves.Count - 1; i >= 0; i--)
             {
-                _nextGroundLeafSpawn = now + 0.3f;
-                int budget = Mathf.Min(4, limit - _groundLeaves.Count);
-                for (int i = 0; i < budget; i++)
+                GroundLeaf leaf = _groundLeaves[i];
+                if (leaf.OnWater) continue;
+                if (leaf.LiftedAt < 0f && wind > 0.015f &&
+                    UnityEngine.Random.value < 1f - Mathf.Exp(-wind * leaf.DriftFactor * 2.8f * dt))
                 {
-                    if (TrySpawnGroundLeaf(now))
-                        _groundLeafDirty = true;
+                    leaf.LiftedAt = now;
+                    leaf.Velocity = _gustDirection * (0.9f + wind * 1.6f) + Vector3.up *
+                        (0.8f + leaf.DriftFactor * 0.65f);
                 }
+                if (leaf.LiftedAt < 0f) continue;
+                float age = now - leaf.LiftedAt;
+                if (age > 5.5f) { _groundLeaves.RemoveAt(i); _groundLeafDirty = true; continue; }
+                Vector3 crosswind = Vector3.Cross(Vector3.up, _gustDirection);
+                // DriftFactor is the leaf itself: a dry one is carried further and faster than
+                // the sodden one next to it, and the two swing across the wind out of step. One
+                // shared target speed is what made a gust look like a slow conveyor belt.
+                float carry = 0.55f + leaf.DriftFactor * 0.62f;
+                Vector3 target = _gustDirection * ((0.85f + wind * 2.1f) * carry) +
+                    crosswind * Mathf.Sin(age * (2.3f + leaf.DriftFactor) + leaf.BobPhase) *
+                        (0.5f + leaf.DriftFactor * 0.55f) +
+                    Vector3.up * (0.35f + Mathf.Sin(age * 2.4f + leaf.BobPhase) * 0.45f) * carry;
+                leaf.Velocity = Vector3.Lerp(leaf.Velocity, target,
+                    1f - Mathf.Exp(-dt * (2.2f + leaf.DriftFactor)));
+                leaf.Drift += leaf.Velocity * dt;
+                leaf.Spin += dt * (100f + leaf.DriftFactor * 90f);
             }
 
-            // A fading layer changes shape every frame, so it is rebuilt on a timer; a permanent
-            // one only when a leaf was added or removed.
-            if ((_groundLeafDirty || lifetime > 0f) && now >= _nextGroundLeafRebuild)
+            for (int i = _groundLeaves.Count - 1; i >= 0; i--)
             {
-                _nextGroundLeafRebuild = now + 0.25f;
+                GroundLeaf leaf = _groundLeaves[i];
+                if (!leaf.OnWater) continue;
+                Camera leafCamera = _worldCamera != null ? _worldCamera : Camera.main;
+                bool distant = leafCamera != null && (leaf.Position - leafCamera.transform.position).sqrMagnitude >
+                    GroundLeafViewerRange * GroundLeafViewerRange * 2f;
+                if (!_leavesOnWater.Value || distant || !AdvanceWaterLeaf(leaf, now, dt))
+                { _groundLeaves.RemoveAt(i); _groundLeafDirty = true; }
+            }
+
+            if (now >= _nextGroundLeafSpawn && wind < 0.03f)
+            {
+                _nextGroundLeafSpawn = now + 0.3f;
+                int waterCount = CountWaterLeaves();
+                int waterTarget = _leavesOnWater.Value ? Mathf.Min(300, limit / 4) : 0;
+                // Standing water gets a fifth of the budget and no more. A leaf that drifts into
+                // a fountain or a closed pool never leaves it again, so with one shared ceiling
+                // the still bodies take every slot within the hour and the river is left with
+                // none - which is precisely what the status log showed: water pinned at its
+                // target, nothing spawning, and nothing in it moving.
+                int stillTarget = Mathf.Max(6, waterTarget / 5);
+                Camera camera = _worldCamera != null ? _worldCamera : Camera.main;
+                if (camera != null && waterCount < waterTarget)
+                {
+                    for (int attempt = 0; attempt < 10 && waterCount < waterTarget; attempt++)
+                    {
+                        if (!TrySpawnWaterLeaf(now, camera.transform.position, stillTarget)) continue;
+                        waterCount++;
+                        _groundLeafDirty = true;
+                        if (_groundLeaves.Count > limit)
+                            for (int i = 0; i < _groundLeaves.Count; i++)
+                                if (!_groundLeaves[i].OnWater) { _groundLeaves.RemoveAt(i); break; }
+                    }
+                }
+                int landBudget = Mathf.Min(4, limit - waterTarget - (_groundLeaves.Count - waterCount));
+                for (int i = 0; i < landBudget; i++)
+                    if (TrySpawnGroundLeaf(now)) _groundLeafDirty = true;
+            }
+
+            // Topology changes are infrequent. Motion uploads vertices only, every rendered frame.
+            if (_groundLeafDirty)
+            {
                 _groundLeafDirty = false;
                 RebuildGroundLeafMesh(now, lifetime);
             }
+            else UpdateGroundLeafVertices(now, lifetime);
 
-            if (_groundLeafMaterial != null)
+            // Refresh a third of the leaves per tick, sharing the airborne lighting model.
+            if (now >= _nextGroundLeafLight && _groundLeaves.Count > 0)
             {
-                // Unlit, and named "LookCare", so the decor dimmer deliberately skips it - the
-                // day cycle has to be applied here or the ground would glow at night.
-                float lit = Mathf.Lerp(0.40f, 1f, Mathf.Clamp01(_lastDayWeight));
-                _groundLeafMaterial.SetColor(BaseColorPropertyId, new Color(lit, lit, lit, 1f));
+                _nextGroundLeafLight = now + 0.1f;
+                int slice = Mathf.Min(128, _groundLeaves.Count);
+                for (int i = 0; i < slice; i++)
+                {
+                    if (_groundLeafLightCursor >= _groundLeaves.Count)
+                        _groundLeafLightCursor = 0;
+                    GroundLeaf leaf = _groundLeaves[_groundLeafLightCursor++];
+                    leaf.Illumination = ComputeLeafIllumination(leaf.Position + leaf.Drift);
+                }
+                PushGroundLeafColors();
             }
         }
 
         private bool TrySpawnGroundLeaf(float now)
         {
-            if (_canopyClusters.Count == 0)
-                return false;
             Camera camera = _worldCamera != null ? _worldCamera : Camera.main;
             if (camera == null)
                 return false;
             Vector3 viewer = camera.transform.position;
 
+            if (_canopyClusters.Count == 0) return false;
             CanopyCluster cluster = null;
             float rangeSquared = GroundLeafViewerRange * GroundLeafViewerRange;
             for (int attempt = 0; attempt < 8; attempt++)
@@ -6313,21 +7305,465 @@ namespace OnTogetherDayAndNight
             if (!Physics.Raycast(origin, Vector3.down, out hit, 30f, GetGroundLeafRayMask(),
                     QueryTriggerInteraction.Ignore))
                 return false;
+            Vector3 waterSurface;
+            if (TryGetLeafWaterSurface(origin + Vector3.up * 60f, out waterSurface) &&
+                waterSurface.y > hit.point.y + 0.01f) return false;
             // A leaf does not stay on a cliff or a wall.
             if (hit.normal.y < 0.55f)
                 return false;
+            // Overlapping crowns must not scatter one tree's palette beneath its neighbour.
+            if (NearestClusterPalette(hit.point) != cluster.Palette)
+                return false;
+            bool onWater = false;
 
+            Vector3 surface = onWater ? Vector3.up : hit.normal;
             Quaternion rotation =
-                Quaternion.AngleAxis(UnityEngine.Random.value * 360f, hit.normal) *
-                Quaternion.FromToRotation(Vector3.up, hit.normal);
+                Quaternion.AngleAxis(UnityEngine.Random.value * 360f, surface) *
+                Quaternion.FromToRotation(Vector3.up, surface);
             float size = UnityEngine.Random.Range(0.10f, 0.16f);
             GroundLeaf leaf = new GroundLeaf();
-            leaf.Position = hit.point + hit.normal * 0.02f;
+            leaf.Position = hit.point + surface * (onWater ? 0.04f : 0.02f);
+            leaf.OnWater = onWater;
+            leaf.BobPhase = UnityEngine.Random.value * Mathf.PI * 2f;
+            // A leaf floating on water lies flat however the surface is angled at that instant.
+            leaf.Normal = onWater ? Vector3.up : hit.normal;
             leaf.Right = rotation * Vector3.right * size;
             leaf.Forward = rotation * Vector3.forward * size;
+            leaf.DriftFactor = UnityEngine.Random.Range(0.55f, 1.6f);
             leaf.Frame = cluster.Palette;
             leaf.BornAt = now;
+            leaf.Illumination = ComputeLeafIllumination(leaf.Position + leaf.Drift);
             _groundLeaves.Add(leaf);
+            return true;
+        }
+
+        // Water leaves by kind: how many are afloat at all, how many are sitting on water with
+        // nothing carrying them, and how many of those are on each separate body.
+        private int CountWaterLeaves()
+        {
+            _stillLeafCount = 0;
+            while (_stillLeafPerBody.Count < _leafWaterProbes.Count) _stillLeafPerBody.Add(0);
+            for (int i = 0; i < _stillLeafPerBody.Count; i++) _stillLeafPerBody[i] = 0;
+            int water = 0;
+            for (int i = 0; i < _groundLeaves.Count; i++)
+            {
+                GroundLeaf leaf = _groundLeaves[i];
+                if (!leaf.OnWater) continue;
+                water++;
+                if (leaf.InCurrent || leaf.InWaterfall) continue;
+                _stillLeafCount++;
+                if (leaf.WaterBody >= 0 && leaf.WaterBody < _stillLeafPerBody.Count)
+                    _stillLeafPerBody[leaf.WaterBody]++;
+            }
+            return water;
+        }
+
+        // Roughly one leaf per four square metres of standing water. A fountain basin is a couple
+        // of metres across and gets a handful; a wide pool gets a scattering. Sharing one flat
+        // ceiling between them is what buried the small fountain.
+        private int StillLeafCapFor(int body)
+        {
+            MeshCollider probe = body >= 0 && body < _leafWaterProbes.Count ? _leafWaterProbes[body] : null;
+            Renderer source = probe != null && probe.transform.parent != null
+                ? probe.transform.parent.GetComponent<Renderer>() : null;
+            if (source == null) return 6;
+            Bounds bounds = source.bounds;
+            return Mathf.Clamp(Mathf.RoundToInt(bounds.size.x * bounds.size.z * 0.25f), 4, 90);
+        }
+
+        // Is anything carrying a leaf here - the pool feeding the waterfall, or the river channel
+        // itself? Everywhere else is standing water, whatever it looks like.
+        private bool IsLeafInCurrent(Vector3 position)
+        {
+            for (int i = 0; i < _pondLeafTransforms.Count; i++)
+            {
+                Transform frame = _pondLeafTransforms[i];
+                if (frame == null) continue;
+                Vector3 local = frame.InverseTransformPoint(position);
+                if (Mathf.Abs(local.y - 15.62f) <= 0.6f && Mathf.Abs(local.x) <= PondLeafHalfWidth &&
+                    local.z >= -6f && local.z <= PondLeafBackEdge) return true;
+            }
+            float offChannel;
+            Vector3 flow = RiverLeafDirection(_riverLeafRoute, position, 0f, out offChannel);
+            return offChannel <= RiverLeafReach && flow.sqrMagnitude > 0.001f;
+        }
+
+        private bool TrySpawnWaterLeaf(float now, Vector3 viewer, int stillTarget)
+        {
+            _waterLeafAttempts++;
+            Vector3 unused;
+            TryGetLeafWaterSurface(viewer + Vector3.up * 60f, out unused);
+            if (_leafWaterProbes.Count == 0) return false;
+            MeshCollider selected = _leafWaterProbes[UnityEngine.Random.Range(0, _leafWaterProbes.Count)];
+            if (selected == null) return false;
+            Renderer renderer = selected.transform.parent.GetComponent<Renderer>();
+            if (renderer == null) return false;
+            Bounds bounds = renderer.bounds;
+            float range = 35f;
+            float minX = Mathf.Max(bounds.min.x, viewer.x - range);
+            float maxX = Mathf.Min(bounds.max.x, viewer.x + range);
+            float minZ = Mathf.Max(bounds.min.z, viewer.z - range);
+            float maxZ = Mathf.Min(bounds.max.z, viewer.z + range);
+            if (minX >= maxX || minZ >= maxZ) return false;
+            Vector3 probe = new Vector3(UnityEngine.Random.Range(minX, maxX),
+                Mathf.Max(viewer.y, bounds.max.y) + 60f, UnityEngine.Random.Range(minZ, maxZ));
+            Vector3 surface;
+            int body;
+            if (!TryGetLeafWaterSurface(probe, out surface, out body)) return false;
+            _waterLeafHits++;
+            RaycastHit obstruction;
+            if (Physics.Raycast(probe, Vector3.down, out obstruction, Mathf.Max(0f, probe.y - surface.y - 0.15f),
+                GetGroundLeafRayMask(), QueryTriggerInteraction.Ignore))
+            { _waterLeafBlocked++; return false; }
+
+            bool inCurrent = IsLeafInCurrent(surface);
+            if (!inCurrent)
+            {
+                if (_stillLeafCount >= stillTarget) return false;
+                int onBody = body >= 0 && body < _stillLeafPerBody.Count ? _stillLeafPerBody[body] : 0;
+                if (onBody >= StillLeafCapFor(body)) return false;
+                _stillLeafCount++;
+                while (_stillLeafPerBody.Count <= body) _stillLeafPerBody.Add(0);
+                if (body >= 0) _stillLeafPerBody[body]++;
+            }
+
+            GroundLeaf leaf = new GroundLeaf();
+            leaf.OnWater = true;
+            leaf.WaterBody = body;
+            leaf.InCurrent = inCurrent;
+            _waterLeafSpawned++;
+            leaf.BobPhase = UnityEngine.Random.value * Mathf.PI * 2f;
+            leaf.Normal = Vector3.up;
+            leaf.Position = surface + Vector3.up * 0.08f;
+            leaf.WaterTarget = leaf.Position;
+            leaf.NextWaterStep = now + UnityEngine.Random.value * 0.2f;
+            Quaternion rotation = Quaternion.AngleAxis(UnityEngine.Random.value * 360f, Vector3.up);
+            float size = UnityEngine.Random.Range(0.10f, 0.16f);
+            leaf.Right = rotation * Vector3.right * size;
+            leaf.Forward = rotation * Vector3.forward * size;
+            leaf.DriftFactor = UnityEngine.Random.Range(0.55f, 1.6f);
+            leaf.FlowSpeed = UnityEngine.Random.Range(0.34f, 0.88f);
+            leaf.Lane = UnityEngine.Random.Range(-1.15f, 1.15f);
+            leaf.WanderAngle = UnityEngine.Random.value * Mathf.PI * 2f;
+            leaf.WanderTurn = UnityEngine.Random.Range(-0.7f, 0.7f);
+            leaf.StepSpeed = leaf.FlowSpeed;
+            leaf.Frame = NearestClusterPalette(leaf.Position);
+            leaf.BornAt = now;
+            leaf.Illumination = ComputeLeafIllumination(leaf.Position);
+            _groundLeaves.Add(leaf);
+            return true;
+        }
+
+        // Probe the rendered mesh, not the top of a swimming volume or a named layer.
+        // Colliders are enabled only for the synchronous query; they never enter a physics step.
+        private bool TryGetLeafWaterSurface(Vector3 origin, out Vector3 surface)
+        {
+            int body;
+            return TryGetLeafWaterSurface(origin, out surface, out body);
+        }
+
+        private bool TryGetLeafWaterSurface(Vector3 origin, out Vector3 surface, out int body)
+        {
+            surface = Vector3.zero;
+            body = -1;
+            if (Time.unscaledTime >= _nextLeafWaterScan)
+            {
+                _nextLeafWaterScan = Time.unscaledTime + 20f;
+                for (int i = _leafWaterProbes.Count - 1; i >= 0; i--)
+                    if (_leafWaterProbes[i] == null) _leafWaterProbes.RemoveAt(i);
+                Renderer[] renderers = UnityEngine.Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None);
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    Renderer source = renderers[i];
+                    if (source == null || source.name.StartsWith("LookCare") ||
+                        !HasStylizedWaterMaterial(source) || !IsHorizontalWaterSurface(source)) continue;
+                    MeshFilter filter = source.GetComponent<MeshFilter>();
+                    if (filter == null || filter.sharedMesh == null) continue;
+                    bool found = false;
+                    for (int j = 0; j < _leafWaterProbes.Count; j++)
+                        if (_leafWaterProbes[j].transform.parent == source.transform) { found = true; break; }
+                    if (found) continue;
+                    GameObject probe = new GameObject("LookCare Leaf Water Probe");
+                    probe.layer = 2; // Ignore Raycast; only Collider.Raycast below can query it.
+                    probe.transform.SetParent(source.transform, false);
+                    MeshCollider collider = probe.AddComponent<MeshCollider>();
+                    collider.enabled = false;
+                    collider.sharedMesh = filter.sharedMesh;
+                    _leafWaterProbes.Add(collider);
+                    Physics.SyncTransforms();
+                }
+                RefreshLeafWaterRoutes();
+            }
+            float closest = float.MaxValue;
+            Ray ray = new Ray(origin, Vector3.down);
+            for (int i = 0; i < _leafWaterProbes.Count; i++)
+            {
+                MeshCollider collider = _leafWaterProbes[i];
+                if (collider == null || !collider.gameObject.activeInHierarchy) continue;
+                Renderer source = collider.transform.parent.GetComponent<Renderer>();
+                if (source == null) continue;
+                Bounds bounds = source.bounds;
+                if (origin.x < bounds.min.x || origin.x > bounds.max.x ||
+                    origin.z < bounds.min.z || origin.z > bounds.max.z) continue;
+                RaycastHit hit;
+                collider.enabled = true;
+                try
+                {
+                    if (collider.Raycast(ray, out hit, 300f) && hit.normal.y > 0.5f && hit.distance < closest)
+                    { closest = hit.distance; surface = hit.point; body = i; }
+                }
+                finally { collider.enabled = false; }
+            }
+            return closest < float.MaxValue;
+        }
+
+        private void RefreshLeafWaterRoutes()
+        {
+            _pondLeafTransforms.Clear();
+            for (int i = 0; i < _leafWaterProbes.Count; i++)
+            {
+                if (_leafWaterProbes[i] == null) continue;
+                Transform parent = _leafWaterProbes[i].transform.parent;
+                MeshFilter filter = parent.GetComponent<MeshFilter>();
+                if (filter != null && filter.sharedMesh != null && filter.sharedMesh.name == "MD_WaterfallHill")
+                    _pondLeafTransforms.Add(parent);
+            }
+            if (_riverLeafRoute.Count > 0 || _pondLeafTransforms.Count == 0) return;
+            GameObject river = GameObject.Find("RiverSpline");
+            if (river == null) return;
+            Component spline = river.GetComponent("SplineContainer");
+            if (spline == null) return;
+            // The native river audio spline follows the channel centre. Sample world positions once.
+            MethodInfo evaluate = spline.GetType().GetMethod("EvaluatePosition", new Type[] { typeof(float) });
+            if (evaluate == null) return;
+            try
+            {
+                for (int i = 0; i <= 128; i++)
+                {
+                    object point = evaluate.Invoke(spline, new object[] { i / 128f });
+                    Type type = point.GetType();
+                    _riverLeafRoute.Add(new Vector3((float)type.GetField("x").GetValue(point),
+                        (float)type.GetField("y").GetValue(point), (float)type.GetField("z").GetValue(point)));
+                }
+                // This is an AUDIO spline: its height is not the water's gradient. Orient it
+                // away from the verified waterfall outlet, then bridge the missing inlet reach.
+                if (_pondLeafTransforms.Count > 0)
+                {
+                    Vector3 outlet = _pondLeafTransforms[0].TransformPoint(PondLeafRoute[PondLeafRoute.Length - 1]);
+                    Vector3 first = _riverLeafRoute[0] - outlet;
+                    Vector3 last = _riverLeafRoute[_riverLeafRoute.Count - 1] - outlet;
+                    first.y = last.y = 0f;
+                    if (last.sqrMagnitude < first.sqrMagnitude) _riverLeafRoute.Reverse();
+                    _riverLeafRoute.Insert(0, outlet);
+                }
+                Logger.LogInfo("LEAF river centreline sampled: " + _riverLeafRoute.Count);
+            }
+            catch (Exception error)
+            {
+                _riverLeafRoute.Clear();
+                Logger.LogWarning("LEAF river route unavailable: " + error.Message);
+            }
+        }
+
+        // Which way the current runs where this leaf is, how far off the channel's centreline it
+        // is, and the line across the channel this particular leaf is holding. The distance is
+        // what separates a river from a pool that merely happens to lie near one.
+        private static Vector3 RiverLeafDirection(List<Vector3> route, Vector3 position, float lane,
+            out float offChannel)
+        {
+            offChannel = float.MaxValue;
+            if (route.Count < 2) return Vector3.zero;
+            float best = float.MaxValue;
+            Vector3 nearest = position;
+            Vector3 flow = Vector3.zero;
+            for (int i = 0; i + 1 < route.Count; i++)
+            {
+                Vector3 start = route[i], end = route[i + 1];
+                start.y = end.y = position.y;
+                Vector3 delta = end - start;
+                if (delta.sqrMagnitude <= 0.0001f) continue;
+                float t = Mathf.Clamp01(Vector3.Dot(position - start, delta) / delta.sqrMagnitude);
+                // Continue past the mouth instead of attracting everything to the last point.
+                if (i == route.Count - 2)
+                    t = Mathf.Max(0f, Vector3.Dot(position - start, delta) / delta.sqrMagnitude);
+                Vector3 point = start + delta * t;
+                float distance = (point - position).sqrMagnitude;
+                if (distance >= best) continue;
+                best = distance;
+                nearest = point;
+                flow = delta.normalized;
+            }
+            if (best == float.MaxValue) return Vector3.zero;
+            offChannel = Mathf.Sqrt(best);
+            // Aim at this leaf's own line down the channel rather than at the middle of it. A
+            // river carries leaves abreast and at their own speeds; correcting every one of them
+            // back onto the centreline is what put them into single file.
+            Vector3 aim = nearest + Vector3.Cross(Vector3.up, flow).normalized * lane;
+            Vector3 direction = flow + Vector3.ClampMagnitude(aim - position, 0.4f);
+            direction.y = 0f;
+            return direction.normalized;
+        }
+
+        private bool AdvanceWaterLeaf(GroundLeaf leaf, float now, float dt)
+        {
+            if (leaf.InWaterfall)
+            {
+                if (leaf.WaterfallTransform == null) return false;
+                Transform frame = leaf.WaterfallTransform;
+                float depth = Mathf.Max(0f, frame.TransformPoint(PondLeafRoute[3]).y - leaf.Position.y);
+                float remaining = Mathf.Sqrt(0.6f * 0.6f + 2f * 3f * depth) * dt;
+                while (remaining > 0f && leaf.WaterfallSegment < PondLeafRoute.Length - 1)
+                {
+                    Vector3 start = frame.TransformPoint(PondLeafRoute[leaf.WaterfallSegment]);
+                    Vector3 end = frame.TransformPoint(PondLeafRoute[leaf.WaterfallSegment + 1]);
+                    float length = Vector3.Distance(start, end);
+                    float travel = Mathf.Min(remaining, Mathf.Max(0f, length - leaf.WaterfallAlong));
+                    leaf.WaterfallAlong += travel;
+                    remaining -= travel;
+                    Vector3 local = Vector3.Lerp(PondLeafRoute[leaf.WaterfallSegment],
+                        PondLeafRoute[leaf.WaterfallSegment + 1], length > 0f ? leaf.WaterfallAlong / length : 1f);
+                    local.x += leaf.WaterfallOffset;
+                    // Keep the quad just in front of the native waterfall sheet, not inside the cliff.
+                    leaf.Position = frame.TransformPoint(local) + (frame.TransformDirection(Vector3.back) + Vector3.up) * 0.08f;
+                    if (leaf.WaterfallAlong >= length - 0.0001f)
+                    { leaf.WaterfallSegment++; leaf.WaterfallAlong = 0f; }
+                }
+                int normalSegment = Mathf.Min(leaf.WaterfallSegment, PondLeafRoute.Length - 2);
+                Vector3 tangent = frame.TransformVector(PondLeafRoute[normalSegment + 1] - PondLeafRoute[normalSegment]);
+                leaf.Normal = Vector3.Cross(frame.TransformDirection(Vector3.right), tangent).normalized;
+                leaf.Drift = Vector3.zero;
+                leaf.Spin += dt * 35f;
+                if (leaf.WaterfallSegment >= PondLeafRoute.Length - 1)
+                {
+                    Vector3 water;
+                    if (!TryGetLeafWaterSurface(leaf.Position + Vector3.up * 0.5f, out water) ||
+                        Mathf.Abs(water.y - leaf.Position.y) > 0.8f) return false;
+                    leaf.Position = water + Vector3.up * 0.08f;
+                    leaf.WaterTarget = leaf.Position;
+                    leaf.InWaterfall = false;
+                    leaf.Normal = Vector3.up;
+                    leaf.NextWaterStep = now;
+                }
+                return true;
+            }
+
+            // Query short safe segments at staggered intervals, then interpolate them every frame.
+            if (now >= leaf.NextWaterStep)
+            {
+                // Staggered, so they do not all take their step on the same tick.
+                leaf.NextWaterStep = now + UnityEngine.Random.Range(0.15f, 0.27f);
+                // A leaf pressed into the rim of a pool fails every one of the narrow candidate
+                // steps below and then sits there for the rest of the session. Notice that it
+                // has stopped moving, open the search out to the full circle, and if even that
+                // cannot free it, let it go. Only something that ought to be moving can be stuck
+                // though: a leaf loitering on still water is meant to go nowhere in particular,
+                // and judging that one by displacement would strand it on its own circles.
+                bool stuck = false, stranded = false;
+                if (!leaf.InCurrent || leaf.StuckSince <= 0f ||
+                    (leaf.Position - leaf.StuckAt).sqrMagnitude > 0.0025f)
+                { leaf.StuckAt = leaf.Position; leaf.StuckSince = now; }
+                else if (now - leaf.StuckSince > 12f) stranded = true;
+                else stuck = now - leaf.StuckSince > 2.5f;
+                Vector3 direction = Vector3.zero;
+                for (int i = 0; i < _pondLeafTransforms.Count; i++)
+                {
+                    Transform frame = _pondLeafTransforms[i];
+                    if (frame == null) continue;
+                    Vector3 local = frame.InverseTransformPoint(leaf.Position);
+                    if (Mathf.Abs(local.y - 15.62f) > 0.6f || Mathf.Abs(local.x) > PondLeafHalfWidth ||
+                        local.z < -6f || local.z > PondLeafBackEdge) continue;
+                    if (local.z < -5.55f && Mathf.Abs(local.x) < 0.85f)
+                    {
+                        leaf.InWaterfall = true;
+                        leaf.WaterfallTransform = frame;
+                        leaf.WaterfallOffset = Mathf.Clamp(local.x, -0.65f, 0.65f);
+                        leaf.WaterfallSegment = 2;
+                        Vector3 entryStart = frame.TransformPoint(PondLeafRoute[2]);
+                        Vector3 entryEnd = frame.TransformPoint(PondLeafRoute[3]);
+                        Vector3 entryDelta = entryEnd - entryStart;
+                        leaf.WaterfallAlong = Mathf.Clamp01(Vector3.Dot(leaf.Position - entryStart,
+                            entryDelta) / entryDelta.sqrMagnitude) * entryDelta.magnitude;
+                        return true;
+                    }
+                    // The pool narrows into the lip, so the leaves are narrowed into it too:
+                    // the further down the pool a leaf is, the less room it is given either
+                    // side of the centre. Arriving at the rim anywhere along its width is what
+                    // left them stranded on it - the waterfall only takes the middle of it.
+                    float alongPool = Mathf.InverseLerp(PondLeafLipZ, 0.5f, local.z);
+                    float spread = Mathf.Lerp(PondLeafLipHalfWidth, 2.4f, alongPool);
+                    Vector3 localTarget = new Vector3(
+                        Mathf.Clamp(local.x * 0.84f + leaf.Lane * 0.3f * alongPool, -spread, spread),
+                        local.y, Mathf.Max(PondLeafLipZ, local.z - 0.8f));
+                    direction = frame.TransformVector(localTarget - local);
+                    direction.y = 0f;
+                    direction.Normalize();
+                    leaf.StepSpeed = leaf.FlowSpeed;
+                    leaf.InCurrent = true;
+                    break;
+                }
+                if (direction.sqrMagnitude < 0.001f)
+                {
+                    float offChannel;
+                    // The line a leaf holds is not a rail: it slides slowly across the channel.
+                    float lane = leaf.Lane + Mathf.Sin(now * (0.22f + leaf.DriftFactor * 0.18f) +
+                        leaf.BobPhase) * 0.45f;
+                    direction = RiverLeafDirection(_riverLeafRoute, leaf.Position, lane, out offChannel);
+                    if (offChannel <= RiverLeafReach && direction.sqrMagnitude > 0.001f)
+                    {
+                        leaf.StepSpeed = leaf.FlowSpeed;
+                        leaf.InCurrent = true;
+                    }
+                    else
+                    {
+                        // Still water: a pool with no outlet, or the open sea well away from the
+                        // river mouth. Nothing carries a leaf here, so it turns on itself and
+                        // creeps wherever it happens to be pointing. Sending it off in the
+                        // river's direction instead is what marched a closed pond into a wall.
+                        leaf.WanderAngle += (leaf.WanderTurn + UnityEngine.Random.Range(-0.5f, 0.5f)) * 0.2f;
+                        direction = new Vector3(Mathf.Sin(leaf.WanderAngle), 0f, Mathf.Cos(leaf.WanderAngle));
+                        leaf.StepSpeed = leaf.FlowSpeed * (0.1f + Mathf.Abs(leaf.WanderTurn) * 0.14f);
+                        leaf.InCurrent = false;
+                    }
+                }
+                // Nothing is carrying it, so it is on borrowed time: it soaks through and sinks,
+                // and its slot goes back to the water that is actually moving.
+                if (leaf.InCurrent) leaf.StillExpiry = -1f;
+                else if (leaf.StillExpiry < 0f)
+                    leaf.StillExpiry = now + UnityEngine.Random.Range(45f, 105f);
+                // Twelve seconds held against a rim with nowhere to go in any direction: it has
+                // run aground. Fade it out rather than snapping it away.
+                if (stranded && (leaf.StillExpiry < 0f || leaf.StillExpiry > now + GroundLeafFadeSeconds))
+                    leaf.StillExpiry = now + GroundLeafFadeSeconds;
+                if (leaf.StillExpiry > 0f && now >= leaf.StillExpiry) return false;
+                leaf.WaterTarget = leaf.Position;
+                if (direction.sqrMagnitude > 0.001f)
+                {
+                    // Slight lateral alternatives follow a bank instead of crossing it; a leaf
+                    // that has stopped moving is allowed to look all the way behind itself.
+                    int fan = stuck ? 15 : 5;
+                    for (int attempt = 0; attempt < fan; attempt++)
+                    {
+                        float angle = attempt == 0 ? 0f : ((attempt + 1) / 2) * 25f * (attempt % 2 == 0 ? -1f : 1f);
+                        Vector3 step = Quaternion.AngleAxis(angle, Vector3.up) * direction * 0.24f;
+                        Vector3 candidate = leaf.Position + step;
+                        Vector3 water;
+                        if (!TryGetLeafWaterSurface(candidate + Vector3.up * 0.5f, out water) ||
+                            Mathf.Abs(water.y + 0.08f - leaf.Position.y) > 0.3f) continue;
+                        RaycastHit bank;
+                        if (Physics.SphereCast(leaf.Position + Vector3.up * 0.06f, 0.13f,
+                            step.normalized, out bank, step.magnitude, GetGroundLeafRayMask(),
+                            QueryTriggerInteraction.Ignore)) continue;
+                        if (Physics.Raycast(water + Vector3.up * 0.35f, Vector3.down, out bank, 0.30f,
+                            GetGroundLeafRayMask(), QueryTriggerInteraction.Ignore)) continue;
+                        leaf.WaterTarget = water + Vector3.up * 0.08f;
+                        break;
+                    }
+                }
+            }
+            leaf.Position = Vector3.MoveTowards(leaf.Position, leaf.WaterTarget, leaf.StepSpeed * dt);
+            leaf.Drift = Vector3.zero;
+            // Half of them turn the other way; a raft all spinning clockwise reads as machinery.
+            leaf.Spin += dt * leaf.DriftFactor * (leaf.WanderTurn >= 0f ? 9f : -9f);
             return true;
         }
 
@@ -6337,6 +7773,8 @@ namespace OnTogetherDayAndNight
                 return _groundLeafRayMask;
             _groundLeafRayMaskReady = true;
             int mask = Physics.DefaultRaycastLayers;
+            // Water is excluded here and handled by its own probe: this ray starts under a tree
+            // crown, and the crowns are all on land.
             string[] excluded = new string[]
             {
                 "Player", "DeskRender", "IgnorePlayer", "PlayerRender", "Water", "UI"
@@ -6351,6 +7789,61 @@ namespace OnTogetherDayAndNight
             return mask;
         }
 
+        private void LeafQuad(GroundLeaf leaf, float now, float lifetime,
+            out Vector3 centre, out Vector3 right, out Vector3 forward)
+        {
+            float scale = lifetime > 0f ? Mathf.Clamp01((lifetime - (now - leaf.BornAt)) / GroundLeafFadeSeconds) : 1f;
+            if (leaf.LiftedAt >= 0f) scale *= Mathf.Clamp01((5.5f - (now - leaf.LiftedAt)) / 1.5f);
+            // A leaf that has sat on still water long enough soaks through and goes under. This
+            // is what keeps the fountains and the closed pools turning over rather than silting
+            // up with the same leaves for the rest of the session.
+            if (leaf.StillExpiry > 0f)
+                scale *= Mathf.Clamp01((leaf.StillExpiry - now) / GroundLeafFadeSeconds);
+            right = leaf.Right;
+            forward = leaf.Forward;
+            if (leaf.InWaterfall)
+            {
+                Quaternion tilt = Quaternion.FromToRotation(Vector3.up, leaf.Normal);
+                right = tilt * right;
+                forward = tilt * forward;
+            }
+            if (leaf.Spin != 0f)
+            {
+                Quaternion spin = leaf.LiftedAt >= 0f
+                    ? Quaternion.Euler(leaf.Spin * 0.7f, leaf.Spin, Mathf.Sin(leaf.Spin * 0.02f) * 60f)
+                    : Quaternion.AngleAxis(leaf.Spin, leaf.Normal);
+                right = spin * right;
+                forward = spin * forward;
+            }
+            right *= scale;
+            forward *= scale;
+            centre = leaf.Position + leaf.Drift;
+            if (leaf.OnWater && !leaf.InWaterfall)
+                centre.y += Mathf.Sin(Time.time * 0.9f + leaf.BobPhase) * 0.035f;
+        }
+
+        private void UpdateGroundLeafVertices(float now, float lifetime)
+        {
+            if (_groundLeafMesh == null || _groundLeafDrawn.Count == 0) return;
+            bool changed = false;
+            for (int i = 0; i < _groundLeafDrawn.Count; i++)
+            {
+                GroundLeaf leaf = _groundLeaves[_groundLeafDrawn[i]];
+                if (!leaf.OnWater && leaf.LiftedAt < 0f && lifetime <= 0f) continue;
+                Vector3 centre, right, forward;
+                LeafQuad(leaf, now, lifetime, out centre, out right, out forward);
+                int vertex = i * 4;
+                _groundLeafVertices[vertex] = centre - right - forward;
+                _groundLeafVertices[vertex + 1] = centre + right - forward;
+                _groundLeafVertices[vertex + 2] = centre - right + forward;
+                _groundLeafVertices[vertex + 3] = centre + right + forward;
+                changed = true;
+            }
+            if (!changed) return;
+            _groundLeafMesh.SetVertices(_groundLeafVertices);
+            _groundLeafMesh.RecalculateBounds();
+        }
+
         private void RebuildGroundLeafMesh(float now, float lifetime)
         {
             EnsureGroundLeafObject();
@@ -6360,25 +7853,24 @@ namespace OnTogetherDayAndNight
             _groundLeafVertices.Clear();
             _groundLeafUvs.Clear();
             _groundLeafTriangles.Clear();
+            _groundLeafColors.Clear();
+            _groundLeafDrawn.Clear();
             for (int i = 0; i < _groundLeaves.Count; i++)
             {
                 GroundLeaf leaf = _groundLeaves[i];
-                float scale = 1f;
-                if (lifetime > 0f)
-                {
-                    float remaining = lifetime - (now - leaf.BornAt);
-                    if (remaining < GroundLeafFadeSeconds)
-                        scale = Mathf.Clamp01(remaining / GroundLeafFadeSeconds);
-                    if (scale <= 0.02f)
-                        continue;
-                }
-                Vector3 right = leaf.Right * scale;
-                Vector3 forward = leaf.Forward * scale;
+                Vector3 centre, right, forward;
+                LeafQuad(leaf, now, lifetime, out centre, out right, out forward);
                 int baseIndex = _groundLeafVertices.Count;
-                _groundLeafVertices.Add(leaf.Position - right - forward);
-                _groundLeafVertices.Add(leaf.Position + right - forward);
-                _groundLeafVertices.Add(leaf.Position - right + forward);
-                _groundLeafVertices.Add(leaf.Position + right + forward);
+                _groundLeafDrawn.Add(i);
+                Color lit = leaf.Illumination;
+                _groundLeafColors.Add(lit);
+                _groundLeafColors.Add(lit);
+                _groundLeafColors.Add(lit);
+                _groundLeafColors.Add(lit);
+                _groundLeafVertices.Add(centre - right - forward);
+                _groundLeafVertices.Add(centre + right - forward);
+                _groundLeafVertices.Add(centre - right + forward);
+                _groundLeafVertices.Add(centre + right + forward);
                 // Same tile layout the atlas was written with: frame 0 top-left, then right,
                 // then the bottom row. Texture rows run bottom-up.
                 float u0 = (leaf.Frame % 2) * 0.5f;
@@ -6400,36 +7892,53 @@ namespace OnTogetherDayAndNight
                 return;
             _groundLeafMesh.SetVertices(_groundLeafVertices);
             _groundLeafMesh.SetUVs(0, _groundLeafUvs);
+            _groundLeafMesh.SetColors(_groundLeafColors);
             _groundLeafMesh.SetTriangles(_groundLeafTriangles, 0);
             _groundLeafMesh.RecalculateBounds();
+        }
+
+        // Colours only - the geometry is untouched, so this is cheap enough to run four times a
+        // second on a few hundred leaves.
+        private void PushGroundLeafColors()
+        {
+            if (_groundLeafDirty || _groundLeafMesh == null || _groundLeafDrawn.Count == 0)
+                return;
+            if (_groundLeafColors.Count != _groundLeafDrawn.Count * 4)
+                return;
+            for (int i = 0; i < _groundLeafDrawn.Count; i++)
+            {
+                int index = _groundLeafDrawn[i];
+                // A rebuild is pending after a removal; leave the old colours until it lands.
+                if (index >= _groundLeaves.Count)
+                    return;
+                Color lit = _groundLeaves[index].Illumination;
+                _groundLeafColors[i * 4] = lit;
+                _groundLeafColors[i * 4 + 1] = lit;
+                _groundLeafColors[i * 4 + 2] = lit;
+                _groundLeafColors[i * 4 + 3] = lit;
+            }
+            _groundLeafMesh.SetColors(_groundLeafColors);
         }
 
         private void EnsureGroundLeafObject()
         {
             if (_groundLeafObject != null || _autumnLeafAtlas == null)
                 return;
-            Shader shader = GetFaceTintShader();
+            // Sprites/Default rather than URP/Unlit: it multiplies the texture by the vertex
+            // colour, which is the only way to light each leaf separately out of one mesh. URP's
+            // unlit shader ignores vertex colour entirely, so the whole layer could only ever
+            // have one brightness - a leaf under a lamp stayed as dark as one in a field.
+            Shader shader = Shader.Find("Sprites/Default");
             if (shader == null)
                 return;
 
             _groundLeafMaterial = new Material(shader);
             _groundLeafMaterial.name = "LookCare Ground Leaves";
-            _groundLeafMaterial.SetTexture("_BaseMap", _autumnLeafAtlas);
-            _groundLeafMaterial.SetColor("_BaseColor", Color.white);
-            _groundLeafMaterial.SetFloat("_Surface", 1f);
-            _groundLeafMaterial.SetFloat("_Blend", 0f);
-            _groundLeafMaterial.SetFloat("_AlphaClip", 0f);
-            _groundLeafMaterial.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
-            _groundLeafMaterial.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-            PreserveDestinationAlpha(_groundLeafMaterial);
-            _groundLeafMaterial.SetFloat("_ZWrite", 0f);
-            _groundLeafMaterial.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
-            _groundLeafMaterial.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-            _groundLeafMaterial.DisableKeyword("_ALPHATEST_ON");
-            _groundLeafMaterial.SetShaderPassEnabled("ShadowCaster", false);
-            // After everything opaque but before the water, so a leaf lies on the ground and is
-            // still covered by the sea where the two meet.
-            _groundLeafMaterial.renderQueue = 2900;
+            _groundLeafMaterial.mainTexture = _autumnLeafAtlas;
+            // Sprites/Default premultiplies in the fragment and blends One/OneMinusSrcAlpha, so
+            // its alpha output is a correct "over" and the desk-pet window's alpha survives.
+            // Floating leaves must composite after transparent water. Land probes reject submerged ground.
+            _groundLeafMaterial.renderQueue = 3200;
 
             _groundLeafObject = new GameObject("LookCare Ground Leaves");
             _groundLeafObject.transform.position = Vector3.zero;
@@ -6448,7 +7957,14 @@ namespace OnTogetherDayAndNight
 
         private void ClearGroundLeaves()
         {
+            for (int i = 0; i < _leafWaterProbes.Count; i++)
+                if (_leafWaterProbes[i] != null) Destroy(_leafWaterProbes[i].gameObject);
+            _leafWaterProbes.Clear();
+            _riverLeafRoute.Clear();
+            _pondLeafTransforms.Clear();
+            _nextLeafWaterScan = 0f;
             _groundLeaves.Clear();
+            _groundLeafDrawn.Clear();
             _groundLeafDirty = false;
             if (_groundLeafMesh != null)
                 _groundLeafMesh.Clear();
@@ -6467,6 +7983,127 @@ namespace OnTogetherDayAndNight
             _groundLeafMesh = null;
             _groundLeafMaterial = null;
             _groundLeafRenderer = null;
+        }
+
+        // Leaf lighting has no face-readability floor: use coloured ambient and lamp light.
+        private Color ComputeLeafIllumination(Vector3 position)
+        {
+            float day = Mathf.Clamp01(_lastDayWeight);
+            float ambient = Mathf.Clamp(_ambientIntensity.Value, 0.2f, 2f);
+            float moon = Mathf.Lerp(0.42f, 1f, Mathf.Clamp01(_nightBrightness.Value));
+            Color night = new Color(0.16f, 0.19f, 0.26f) * moon * ambient;
+            Color daylight = Color.Lerp(Color.white, new Color(0.86f, 0.92f, 1f),
+                Mathf.Clamp01(_ambientCoolShift.Value)) * Mathf.Lerp(0.75f, 1.1f, ambient / 2f);
+            Color light = Color.Lerp(night, daylight, day);
+            light *= Mathf.Lerp(1f, 0.78f, _rainBlend);
+            RefreshLeafLampSamples();
+            for (int i = 0; i < _leafLampSamples.Count; i++)
+            {
+                LeafLampSample lamp = _leafLampSamples[i];
+                Vector3 offset = position - lamp.Position;
+                float squared = offset.sqrMagnitude;
+                if (squared >= lamp.Range * lamp.Range) continue;
+                float distance = Mathf.Sqrt(squared);
+                float attenuation = 1f - distance / lamp.Range;
+                attenuation *= attenuation;
+                if (lamp.SpotEdge > -1f && distance > 0.001f)
+                    attenuation *= Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(lamp.SpotEdge,
+                        1f, Vector3.Dot(lamp.Forward, offset / distance)));
+                light += lamp.Radiance * attenuation;
+            }
+            // The main light has a floor under it so that trees, paths and people stay readable
+            // after dark. Without the same floor here a leaf sat several stops below the ground
+            // it was lying on and read as a hole in it rather than as a leaf at night.
+            float floor = Mathf.Clamp(_minimumNightLight.Value, 0.15f, 0.7f) * 0.52f * ambient *
+                Mathf.Lerp(1f, 0.84f, _rainBlend);
+            light.r = Mathf.Clamp01(Mathf.Max(light.r, floor * 0.88f));
+            light.g = Mathf.Clamp01(Mathf.Max(light.g, floor * 0.95f));
+            light.b = Mathf.Clamp01(Mathf.Max(light.b, floor * 1.14f));
+            light.a = 1f;
+            return light;
+        }
+
+        private void RefreshLeafLampSamples()
+        {
+            float now = Time.unscaledTime;
+            if (now < _nextLeafLampSnapshot) return;
+            _nextLeafLampSnapshot = now + 0.25f;
+            _leafLampSamples.Clear();
+            Camera camera = _worldCamera != null ? _worldCamera : Camera.main;
+            for (int i = 0; i < _faceLightSources.Count; i++)
+            {
+                Light lamp = _faceLightSources[i];
+                if (lamp == null || !lamp.isActiveAndEnabled || lamp.range < 0.01f) continue;
+                Vector3 position = lamp.transform.position;
+                float range = lamp.range;
+                if (camera != null && (position - camera.transform.position).sqrMagnitude >
+                    (GroundLeafViewerRange + range) * (GroundLeafViewerRange + range)) continue;
+                float intensity = GetLightIntensity(lamp,
+                    Mathf.Clamp(_lampIntensity.Value, 0f, 8f) * _lampWeight);
+                if (intensity <= 0.001f) continue;
+                LeafLampSample sample = new LeafLampSample();
+                sample.Position = position; sample.Range = range;
+                sample.Forward = lamp.transform.forward;
+                sample.SpotEdge = lamp.type == LightType.Spot
+                    ? Mathf.Cos(lamp.spotAngle * 0.5f * Mathf.Deg2Rad) : -1f;
+                sample.Radiance = lamp.color * (intensity * 0.65f);
+                _leafLampSamples.Add(sample);
+            }
+        }
+
+        private Vector3 LightLeafParticles(ParticleSystem system)
+        {
+            if (system == null || system.particleCount == 0) return Vector3.zero;
+            if (_leafLightParticles.Length < system.particleCount)
+                _leafLightParticles = new ParticleSystem.Particle[system.particleCount + 64];
+            int count = ReadLeafParticles(system, _leafLightParticles, _leafLightParticles.Length, 0);
+            ParticleSystem.MainModule main = system.main;
+            Transform space = main.simulationSpace == ParticleSystemSimulationSpace.Custom
+                ? main.customSimulationSpace : system.transform;
+            Vector3 velocity = Vector3.zero;
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 worldVelocity = _leafLightParticles[i].velocity;
+                if (main.simulationSpace != ParticleSystemSimulationSpace.World && space != null)
+                    worldVelocity = space.TransformVector(worldVelocity);
+                velocity += worldVelocity;
+                Vector3 position = _leafLightParticles[i].position;
+                if (main.simulationSpace != ParticleSystemSimulationSpace.World && space != null)
+                    position = space.TransformPoint(position);
+                Color tint = ComputeLeafIllumination(position);
+                tint.a = _leafLightParticles[i].startColor.a / 255f;
+                _leafLightParticles[i].startColor = tint;
+            }
+            WriteLeafParticles(system, _leafLightParticles, count, 0);
+            velocity.y = 0f;
+            return count > 0 ? velocity / count : Vector3.zero;
+        }
+
+        private void UpdateLeafEmitterLighting()
+        {
+            float now = Time.unscaledTime;
+            if (now < _nextLeafEmitterLight) return;
+            _nextLeafEmitterLight = now + 0.02f;
+            Camera camera = _worldCamera != null ? _worldCamera : Camera.main;
+            // Spread native Get/SetParticles synchronization over frames, skipping distant systems.
+            for (int i = 0; i < Mathf.Min(4, _leafEmitters.Count); i++)
+            {
+                if (_leafEmitterLightCursor >= _leafEmitters.Count) _leafEmitterLightCursor = 0;
+                LeafEmitterState state = _leafEmitters[_leafEmitterLightCursor++];
+                if (state.System == null || state.Renderer == null || !state.Renderer.isVisible) continue;
+                if (camera != null && (state.Renderer.bounds.center - camera.transform.position).sqrMagnitude >
+                    GroundLeafViewerRange * GroundLeafViewerRange) continue;
+                state.WindVelocity = LightLeafParticles(state.System);
+                state.WindSampleAt = now;
+            }
+            LightLeafParticles(_leafKick);
+            Vector3 sum = Vector3.zero;
+            int samples = 0;
+            for (int i = 0; i < _leafEmitters.Count; i++)
+                if (now - _leafEmitters[i].WindSampleAt < 0.6f && _leafEmitters[i].WindSampleAt > 0f)
+                { sum += _leafEmitters[i].WindVelocity; samples++; }
+            if (samples > 0) _airborneLeafWind = sum / samples;
+            else _airborneLeafWind = _gustDirection * (_gustStrength * _gustStrengthScale.Value * 2.2f);
         }
 
         private void RestoreLeafFall()
@@ -6500,8 +8137,27 @@ namespace OnTogetherDayAndNight
                     ParticleSystem.ShapeModule shape = state.System.shape;
                     shape.radius = state.OriginalShapeRadius;
                 }
-                if (state.Renderer != null && state.OriginalMaterial != null)
-                    state.Renderer.sharedMaterial = state.OriginalMaterial;
+                ParticleSystem.ExternalForcesModule external = state.System.externalForces;
+                external.enabled = state.OriginalExternalForces;
+                if (state.NoiseCaptured)
+                {
+                    ParticleSystem.NoiseModule noise = state.System.noise;
+                    noise.enabled = state.OriginalNoiseEnabled;
+                    noise.strengthMultiplier = state.OriginalNoiseStrength;
+                    noise.frequency = state.OriginalNoiseFrequency;
+                }
+                ParticleSystem.VelocityOverLifetimeModule velocity = state.System.velocityOverLifetime;
+                velocity.enabled = state.OriginalVelocityEnabled;
+                velocity.space = state.OriginalVelocitySpace;
+                velocity.x = state.OriginalVelocityX;
+                velocity.y = state.OriginalVelocityY;
+                velocity.z = state.OriginalVelocityZ;
+                if (state.Renderer != null)
+                {
+                    state.Renderer.SetPropertyBlock(null);
+                    if (state.OriginalMaterial != null)
+                        state.Renderer.sharedMaterial = state.OriginalMaterial;
+                }
             }
             _leafEmitters.Clear();
         }
@@ -6937,7 +8593,7 @@ namespace OnTogetherDayAndNight
         {
             float low = Mathf.Clamp(_surfaceShadeStep.Value, 0.05f, 0.8f);
             float high = Mathf.Clamp(_surfaceNoonShadeStep.Value, low, 0.8f);
-            float maxElevation = Mathf.Clamp(_maxElevation.Value, 20f, 80f);
+            float maxElevation = Mathf.Clamp(_maxElevation.Value, 20f, 80f) * AutumnSunScale();
             float heightWeight = Mathf.InverseLerp(6f, maxElevation, Mathf.Abs(elevation));
             return Mathf.Lerp(low, high, heightWeight);
         }
@@ -7689,6 +9345,7 @@ namespace OnTogetherDayAndNight
                     return null;
                 }
                 _haloMaterial = new Material(shader);
+                _haloMaterial.renderQueue = 3201;
                 _haloMaterial.mainTexture = CreateGlowTexture();
                 _haloMaterial.color = new Color(1f, 0.86f, 0.62f, 0f);
             }
@@ -8021,6 +9678,12 @@ namespace OnTogetherDayAndNight
             float angle = phase * Mathf.PI * 2f;
             Vector3 lightDirection = new Vector3(Mathf.Sin(angle), 0f, -Mathf.Cos(angle));
             Color litColor = _moonColor.Value;
+            if (_appliedSeason == 1 && _harvestMoon.Value)
+            {
+                // A harvest moon is deep gold rather than the usual cold white. Blended over
+                // whatever the moon colour is set to, so the setting still does something.
+                litColor = Color.Lerp(litColor, HarvestMoonColor, 0.8f);
+            }
             Color darkColor = new Color(0.055f, 0.075f, 0.14f, 1f);
             Vector3[] craters = new Vector3[]
             {
@@ -8122,7 +9785,10 @@ namespace OnTogetherDayAndNight
                 : -_sunLight.transform.forward;
             _moonObject.transform.position = camera.transform.position + moonDirection * distance;
             _moonObject.transform.rotation = camera.transform.rotation;
-            float scale = distance * Mathf.Clamp(_moonSize.Value, 0.025f, 0.16f);
+            float moonSize = Mathf.Clamp(_moonSize.Value, 0.025f, 0.16f);
+            if (_appliedSeason == 1 && _harvestMoon.Value)
+                moonSize *= 1.35f;
+            float scale = distance * moonSize;
             _moonObject.transform.localScale = new Vector3(scale, scale, 1f);
             _moonMaterial.color = new Color(1f, 1f, 1f, nightVisibility);
             _moonObject.SetActive(true);
@@ -9279,6 +10945,10 @@ namespace OnTogetherDayAndNight
         {
             if (!_weatherEnabled.Value)
                 raining = false;
+            // Stopping the rain by hand means stopping it, not wrestling with the always-on
+            // switch for the two seconds until it turns the rain straight back on.
+            if (manual && !raining && _alwaysRain != null && _alwaysRain.Value)
+                _alwaysRain.Value = false;
             if (_rainTarget == raining && !manual)
                 return;
             _rainTarget = raining;
@@ -9296,10 +10966,18 @@ namespace OnTogetherDayAndNight
 
         private void ScheduleWeatherChange(bool raining)
         {
-            float minMinutes = raining ? _rainMinutesMin.Value : _clearMinutesMin.Value;
-            float maxMinutes = raining ? _rainMinutesMax.Value : _clearMinutesMax.Value;
-            minMinutes = Mathf.Max(0.2f, minMinutes);
-            maxMinutes = Mathf.Max(minMinutes, maxMinutes);
+            float minMinutes = Mathf.Max(0.2f, _rainMinutesMin.Value);
+            float maxMinutes = Mathf.Max(minMinutes, _rainMinutesMax.Value);
+            if (!raining)
+            {
+                // The dry stretch is worked out from the chance and the length of a shower rather
+                // than configured alongside them, so the slider means what it says: at 0.25 it
+                // rains about a quarter of the time whatever the showers are set to.
+                float chance = Mathf.Clamp(_rainChance.Value, 0.02f, 0.9f);
+                float clear = (minMinutes + maxMinutes) * 0.5f * (1f - chance) / chance;
+                minMinutes = clear * 0.62f;
+                maxMinutes = clear * 1.38f;
+            }
             float minutes = Mathf.Lerp(minMinutes, maxMinutes, (float)_weatherRandom.NextDouble());
             _nextWeatherChange = Time.unscaledTime + minutes * 60f;
         }
@@ -9313,7 +10991,12 @@ namespace OnTogetherDayAndNight
                 _worldSceneReady = GameObject.Find("Island") != null;
             }
 
-            if (_weatherEnabled.Value && _randomRain.Value && _worldSceneReady &&
+            if (_weatherEnabled.Value && _alwaysRain.Value)
+            {
+                if (!_rainTarget)
+                    SetRainTarget(true, true);
+            }
+            else if (_weatherEnabled.Value && _randomRain.Value && _worldSceneReady &&
                 now >= _nextWeatherChange)
                 SetRainTarget(!_rainTarget, false);
 
@@ -10320,11 +12003,106 @@ namespace OnTogetherDayAndNight
                 DontDestroyOnLoad(_natureAudioObject);
                 _cicadaAudioSource = CreateNatureAudioSource(_natureAudioObject, "Noon Cicadas");
                 _nightNatureAudioSource = CreateNatureAudioSource(_natureAudioObject, "Night Insects and Frogs");
+                _windAudioSource = CreateNatureAudioSource(_natureAudioObject, "Gust Wind");
+                // One-shots rather than beds: these are driven by Play(), not by a volume ramp.
+                _leafStepSource = CreateNatureAudioSource(_natureAudioObject, "Leaf Steps");
+                _leafStepSource.loop = false;
+                _crowAudioSource = CreateNatureAudioSource(_natureAudioObject, "Crows");
+                _crowAudioSource.loop = false;
             }
             if (_natureAudioLoadAttempted || _natureAudioLoadRoutine != null)
                 return;
             _natureAudioLoadAttempted = true;
             _natureAudioLoadRoutine = StartCoroutine(LoadNatureAudioClips());
+        }
+
+        // Wind, synthesised. White noise through a one-pole low pass is the body of it; the
+        // residue above that cutoff is the hiss through leaves. A pair of slow, mutually
+        // detuned oscillators gives it the swell real wind has, and the last half second is
+        // cross-faded into the first so the loop has no seam.
+        private AudioClip CreateWindClip()
+        {
+            const int rate = 22050;
+            const int seconds = 6;
+            const int fade = rate / 2;
+            int generated = rate * seconds;
+            int length = generated - fade;
+
+            float[] data = new float[generated];
+            System.Random random = new System.Random(20260904);
+            float low = 0f;
+            float band = 0f;
+            for (int i = 0; i < generated; i++)
+            {
+                float white = (float)(random.NextDouble() * 2.0 - 1.0);
+                low += (white - low) * 0.030f;
+                float residue = white - low;
+                band += (residue - band) * 0.12f;
+                // Measured with cascaded one-pole bands (a sparse DFT aliases badly and reports
+                // nonsense above a few hundred Hz): this falls 100 / 57 / 47 / 31 / 18 / 4 across
+                // <80, 80-250, 250-800, 0.8-2.5k, 2.5-8k, >8k Hz. Low-frequency body with just
+                // enough top left to read as air through leaves rather than as a rumble.
+                data[i] = low * 3.4f + band * 0.10f;
+            }
+
+            // Swell. The two rates are deliberately not multiples of each other, so the pattern
+            // does not repeat inside the loop.
+            for (int i = 0; i < generated; i++)
+            {
+                float t = (float)i / rate;
+                float swell = 0.60f + 0.40f *
+                    (0.5f + 0.5f * Mathf.Sin(t * 0.83f)) * (0.5f + 0.5f * Mathf.Sin(t * 0.29f + 1.7f));
+                data[i] *= swell;
+            }
+
+            for (int i = 0; i < fade; i++)
+            {
+                float k = (float)i / fade;
+                data[i] = data[i] * k + data[length + i] * (1f - k);
+            }
+
+            float peak = 0f;
+            for (int i = 0; i < length; i++)
+                peak = Mathf.Max(peak, Mathf.Abs(data[i]));
+            float gain = peak > 0.0001f ? 0.92f / peak : 1f;
+            float[] output = new float[length];
+            for (int i = 0; i < length; i++)
+                output[i] = data[i] * gain;
+
+            // Filled through a PCM reader rather than SetData: in this Unity version SetData's
+            // only overload takes a ReadOnlySpan, which the C# 5 compiler this plugin is built
+            // with cannot resolve, and adding the assembly that defines it collides with the
+            // compiler's own mscorlib. The reader form has been there since forever and needs
+            // no extra reference.
+            _windSamples = output;
+            _windReadPosition = 0;
+            return AudioClip.Create("LookCare Wind", length, 1, rate, false,
+                OnWindPcmRead, OnWindPcmSetPosition);
+        }
+
+        private void OnWindPcmRead(float[] data)
+        {
+            if (_windSamples == null || _windSamples.Length == 0)
+            {
+                for (int i = 0; i < data.Length; i++)
+                    data[i] = 0f;
+                return;
+            }
+            for (int i = 0; i < data.Length; i++)
+            {
+                data[i] = _windSamples[_windReadPosition];
+                _windReadPosition++;
+                if (_windReadPosition >= _windSamples.Length)
+                    _windReadPosition = 0;
+            }
+        }
+
+        private void OnWindPcmSetPosition(int position)
+        {
+            if (_windSamples == null || _windSamples.Length == 0)
+                return;
+            _windReadPosition = ((position % _windSamples.Length) + _windSamples.Length) %
+                _windSamples.Length;
         }
 
         private static AudioSource CreateNatureAudioSource(GameObject holder, string sourceName)
@@ -10349,6 +12127,41 @@ namespace OnTogetherDayAndNight
             yield return StartCoroutine(LoadNatureAudioClip(
                 Path.Combine(audioDirectory, "night_crickets_frogs_cc0.ogg"),
                 delegate(AudioClip clip) { _nightNatureAudioClip = clip; }));
+            // Autumn's own three. Absent by default - the mod ships without them - so each is
+            // resolved by base name across the formats Unity can stream, and everything that
+            // uses one simply stays silent when it is not there.
+            yield return StartCoroutine(LoadNatureAudioClip(
+                ResolveAudioFile(audioDirectory, "autumn_leaf_step"),
+                delegate(AudioClip clip) { _leafStepClip = clip; }));
+            yield return StartCoroutine(LoadNatureAudioClip(
+                ResolveAudioFile(audioDirectory, "wind_gust"),
+                delegate(AudioClip clip) { _windAudioClip = clip; }));
+            // Several calls, picked at random, so one recording does not repeat all afternoon.
+            // crow_call.* plus crow_call_1..8.*, whichever are present.
+            _crowClips.Clear();
+            for (int index = 0; index <= 8; index++)
+            {
+                string baseName = index == 0 ? "crow_call" : "crow_call_" + index;
+                string candidate = ResolveAudioFile(audioDirectory, baseName);
+                if (!File.Exists(candidate))
+                    continue;
+                yield return StartCoroutine(LoadNatureAudioClip(candidate,
+                    delegate(AudioClip clip) { if (clip != null) _crowClips.Add(clip); }));
+            }
+            if (_windAudioClip == null)
+            {
+                // No file supplied. Wind is filtered noise, which synthesises convincingly and
+                // has a real advantage here: a generated bed can be driven straight off the gust
+                // envelope, so the sound arrives with the wind rather than being a recording
+                // faded up underneath it.
+                _windAudioClip = CreateWindClip();
+                _windGenerated = true;
+            }
+            if (_windAudioSource != null)
+                _windAudioSource.clip = _windAudioClip;
+            Logger.LogInfo("NATURE AUDIO autumn steps=" + DescribeAudioClip(_leafStepClip) +
+                " wind=" + DescribeAudioClip(_windAudioClip) + (_windGenerated ? " (generated)" : "") +
+                " crowClips=" + _crowClips.Count);
 
             if (_cicadaAudioSource != null)
                 _cicadaAudioSource.clip = _cicadaAudioClip;
@@ -10359,16 +12172,40 @@ namespace OnTogetherDayAndNight
                 " night=" + DescribeAudioClip(_nightNatureAudioClip));
         }
 
+        // The bundled clips are .ogg, but a user dropping in their own may well have a .wav or
+        // .mp3, and there is no reason to make them convert it.
+        private static string ResolveAudioFile(string directory, string baseName)
+        {
+            string[] extensions = new string[] { ".ogg", ".wav", ".mp3" };
+            for (int i = 0; i < extensions.Length; i++)
+            {
+                string candidate = Path.Combine(directory, baseName + extensions[i]);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+            return Path.Combine(directory, baseName + ".ogg");
+        }
+
+        private static AudioType GuessAudioType(string path)
+        {
+            string extension = Path.GetExtension(path).ToLowerInvariant();
+            if (extension == ".wav")
+                return AudioType.WAV;
+            if (extension == ".mp3")
+                return AudioType.MPEG;
+            return AudioType.OGGVORBIS;
+        }
+
         private IEnumerator LoadNatureAudioClip(string path, Action<AudioClip> assign)
         {
             if (!File.Exists(path))
             {
-                Logger.LogWarning("NATURE AUDIO missing file=" + path);
+                Logger.LogInfo("NATURE AUDIO not present (optional) file=" + Path.GetFileName(path));
                 yield break;
             }
 
             string uri = new Uri(path).AbsoluteUri;
-            using (UnityWebRequest request = UnityWebRequestMultimedia.GetAudioClip(uri, AudioType.OGGVORBIS))
+            using (UnityWebRequest request = UnityWebRequestMultimedia.GetAudioClip(uri, GuessAudioType(path)))
             {
                 DownloadHandlerAudioClip handler = request.downloadHandler as DownloadHandlerAudioClip;
                 if (handler != null)
@@ -10417,13 +12254,34 @@ namespace OnTogetherDayAndNight
             }
 
             float rainScale = Mathf.Lerp(1f, Mathf.Clamp01(_rainNatureMultiplier.Value), _rainBlend);
-            float cicadaTarget = Mathf.Clamp01(_noonCicadaVolume.Value) * noonWeight * worldWeight * rainScale;
+            // Cicadas are a summer sound. In autumn they fade out and the occasional crow takes
+            // their place.
+            float seasonCicada = _appliedSeason == 1 ? 0f : 1f;
+            float cicadaTarget = Mathf.Clamp01(_noonCicadaVolume.Value) * noonWeight * worldWeight *
+                rainScale * seasonCicada;
             float nightTarget = Mathf.Clamp01(_nightNatureVolume.Value) * nightWeight * worldWeight * rainScale;
             float fadeSeconds = Mathf.Clamp(_natureFadeSeconds.Value, 2f, 40f);
             float blend = 1f - Mathf.Exp(-Mathf.Min(Time.unscaledDeltaTime, 0.1f) * 4.6f / fadeSeconds);
 
             UpdateNatureSource(_cicadaAudioSource, cicadaTarget, blend);
             UpdateNatureSource(_nightNatureAudioSource, nightTarget, blend);
+
+            // Wind rides the gust envelope directly rather than the slow ambience fade.
+            if (_windAudioSource != null && _windAudioClip != null)
+            {
+                float windTarget = Mathf.Clamp01(_windVolume.Value) * _gustStrength * worldWeight;
+                // Volume alone reads as a recording being faded up. Wind gets brighter as it gets
+                // stronger, so the pitch rides the gust too - that is what sells the arrival.
+                _windAudioSource.pitch = 0.82f + _gustStrength * 0.5f;
+                _windAudioSource.volume = Mathf.MoveTowards(_windAudioSource.volume, windTarget,
+                    Time.unscaledDeltaTime * 1.8f);
+                if (_windAudioSource.volume > 0.001f && !_windAudioSource.isPlaying)
+                    _windAudioSource.Play();
+                else if (_windAudioSource.volume <= 0.001f && _windAudioSource.isPlaying)
+                    _windAudioSource.Pause();
+            }
+
+            UpdateCrowCalls(worldWeight);
 
             if (_worldSceneReady && (_cicadaAudioClip != null || _nightNatureAudioClip != null))
             {

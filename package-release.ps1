@@ -63,11 +63,19 @@ Remove-Item -LiteralPath $packageRoot -Recurse -Force -ErrorAction SilentlyConti
 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $pluginDirectory | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'On-Together_Day_and_Night.dll') -Destination $pluginDirectory
+$dllPath = Join-Path $PSScriptRoot 'On-Together_Day_and_Night.dll'
+$dllInfo = Get-Item -LiteralPath $dllPath
+$sourceInfo = Get-Item -LiteralPath (Join-Path $PSScriptRoot 'src\DayAndNightPlugin.cs')
+if ($dllInfo.LastWriteTimeUtc -lt $sourceInfo.LastWriteTimeUtc) {
+    throw "On-Together_Day_and_Night.dll is older than src\DayAndNightPlugin.cs. Run build.ps1 first."
+}
+Write-Host ("Packaging DLL built {0} ({1:N0} bytes)" -f $dllInfo.LastWriteTime, $dllInfo.Length)
+Copy-Item -LiteralPath $dllPath -Destination $pluginDirectory
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'audio') -Destination $pluginDirectory -Recurse
 Copy-Item -LiteralPath $manifestPath -Destination $packageRoot
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination $packageRoot
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'CHANGELOG.md') -Destination $packageRoot
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'LICENSE') -Destination $packageRoot
 Copy-Item -LiteralPath $iconPath -Destination $packageRoot
 
 # Compress-Archive writes Windows backslashes into ZIP entry names. Some Linux archive
@@ -96,9 +104,19 @@ $requiredEntries = @(
     'CHANGELOG.md',
     'icon.png',
     'BepInEx/plugins/On-Together_Day_and_Night/On-Together_Day_and_Night.dll',
+    'LICENSE',
     'BepInEx/plugins/On-Together_Day_and_Night/audio/THIRD_PARTY_AUDIO.md',
     'BepInEx/plugins/On-Together_Day_and_Night/audio/noon_cicadas_cc0.ogg',
-    'BepInEx/plugins/On-Together_Day_and_Night/audio/night_crickets_frogs_cc0.ogg'
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/night_crickets_frogs_cc0.ogg',
+    # Autumn's own sounds. A missing clip is silent rather than an error at runtime,
+    # so a package that quietly shipped without them would look fine until played.
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/autumn_leaf_step.ogg',
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/crow_call_1.ogg',
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/crow_call_2.ogg',
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/crow_call_3.ogg',
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/crow_call_4.ogg',
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/crow_call_5.ogg',
+    'BepInEx/plugins/On-Together_Day_and_Night/audio/crow_call_6.ogg'
 )
 $verificationArchive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 try {
@@ -115,7 +133,7 @@ try {
     # Anything outside the root files and the BepInEx tree is something the
     # manager has no rule for, which is exactly the failure being fixed here.
     $strays = @($entryNames | Where-Object {
-        $_ -notmatch '^(manifest\.json|README\.md|CHANGELOG\.md|icon\.png)$' -and
+        $_ -notmatch '^(manifest\.json|README\.md|CHANGELOG\.md|LICENSE|icon\.png)$' -and
         $_ -notmatch '^BepInEx/'
     })
     if ($strays.Count -gt 0) {

@@ -1,4 +1,250 @@
-# 1.0.1.4 (unreleased)
+# 1.0.2
+
+The autumn release. The island can be repainted in red, orange and gold; leaves fall from twenty
+trees instead of the game's three, land, lie where they fall, are carried off by a gust and drift
+away down the river; crows call over the lawn in place of the cicadas; the sun sits lower all day
+and a harvest moon comes up over the sea; and there is a dry crunch underfoot where they have
+piled up.
+
+Alongside it: gusts that cross the island and set the canopies moving, dappled shade under the
+round canopies - which turned out to have no lighting of their own at all - water that reflects
+the sky and receives shadows, and an F11 menu cut back to the settings worth a decision.
+
+The sections below are the stages this release was built in, kept in full. Most of them are a
+record of getting something wrong first, and of what the wrong answer was.
+
+## 1.0.1.8
+
+The constant-gale report was right and my two previous explanations for it were both wrong. The
+cause was mine, and it is this: **the game's falling leaves are almost weightless.**
+
+```
+gravityModifier = 0.010      one percent of gravity
+startSpeed      = 0
+Velocity / Force modules     disabled
+Noise module                 enabled, strength 0.4
+ExternalForces               disabled
+```
+
+A leaf falls about five metres in its ten-second life and drifts on a noise field for the whole of
+it. So an emission rate is not "leaves per second falling past" - it is "leaves permanently hanging
+in the air". The game ships three emitters, about 80 airborne leaves at a time, which reads as a
+sparse drift. 1.0.1.5 set the defaults to 40 trees at 4x rate: **2240 leaves, none of which ever
+landed.** That is the gale. It had nothing to do with the gust system, which the log confirmed was
+running at a 10% duty cycle the whole time - I should have gone on to ask what else could move a
+leaf, instead of treating that as the answer.
+
+- Leaf density corrected: base rate per tree 1.2 to 0.4, `Leaf fall rate` 4 to 1.5, `Shedding
+  trees` 40 to 20 - about 240 leaves in the air across the island, against the game's own 80.
+  Existing configs still holding the old pair are migrated; anyone who tuned their own is left
+  alone. The config text now states what the number actually controls.
+- `ExternalForcesModule` is left disabled except while a gust is blowing. The vanilla emitters have
+  it off deliberately, and leaving it on meant the leaves were no longer behaving as authored even
+  between gusts.
+
+- Fixed no leaves ever landing on water. The ground-leaf probe casts downward from beneath a tree
+  crown, and the crowns all stand on land, so that ray could never reach water no matter how widely
+  it was scattered - the water path was unreachable code. Water now has its own probe near the
+  viewer, which is fair enough for a leaf blown onto a pond: it need not have come off the tree
+  directly above it. Verified against the scene first this time - the Water layer carries three
+  enabled box colliders (`SeaCollider` and two `MD_SeaPlane`), and the probe rejects any hit whose
+  normal is not facing up, so it cannot catch a side wall.
+
+- Bundled six crow calls, picked at random per call: Carrion Crow #1-#5 and Crows #1, all CC0 from
+  BigSoundBank. The earlier suggestion was wrong on its own terms - those recordings are described
+  on the source pages as "probably a magpie or a jackdaw". Crows #1 is a 33-second woodland
+  recording rather than a single call, so it plays as a 2.6-second window from a random point in it.
+
+- Trimmed the F11 menu. A panel with a slider for everything is not a panel anybody can find
+  anything in, and several of these were shipped because they were easy to expose rather than
+  because they were worth deciding about. Gone from the Season tab: canopy shade brightness,
+  canopy shading, recolour lawns and paths, water depth tint, sun elevation multiplier, harvest
+  moon, leaves land on water, kick up leaves when walking. Gone from Night Lights: the campfire,
+  rattan lantern and play-tower sun switches. Every one of them is still there and still works -
+  they live in the config file now, which F4 reloads.
+- The day-cycle length and the held time of day snap to sensible steps instead of to decimal
+  places. A cycle is a whole number of half hours (30 to 1440), and the held time moves in half
+  hours and reads as a clock: `18:30`, not `18.5`.
+- New: **Always raining**, which holds the rain on and stops it clearing by itself. Stopping the
+  rain by hand, with the menu button or F10, turns it off again rather than letting the two fight.
+- New: **Rain chance**, replacing the `Clear minutes minimum/maximum` pair. Those two said the same
+  thing but you could not read the answer off them - how much of the time it actually rains was a
+  sum across four numbers. The length of a shower is still set by the two rain-minute entries; how
+  long it stays clear between showers is worked out from them and this, so 0.25 means about one
+  hour in four is wet. The old clear-minute entries are gone from the config; anyone who tuned them
+  should set the chance instead.
+- Audited the menu's Chinese/English/Japanese table: every string the menu can draw has all three,
+  and the 41 entries left behind by options removed over the last few versions are gone.
+
+- Fixed a gust putting almost nothing in the air. Three things had gone at once: the per-tree base
+  rate had been halved again on top of the 0.4 correction above and the vanilla emitters put on a
+  further 0.55 multiplier, which left about a third of the documented 240; the gust force field was
+  still being built and aimed every frame but nothing called it any more, so it applied to nothing;
+  and `ExternalForcesModule` was pinned off even during a gust, so it could not have applied
+  anyway. Rates are back at the documented pair, the field is driven again, and the emitters opt
+  into it for the length of a gust.
+- A gust now also tears five to twelve leaves off each nearby crown as it arrives, rather than only
+  pushing on whatever happened to already be on its way down. At one percent gravity a leaf hangs
+  for its full ten seconds, so an emission rate sets how many are *hanging*; the leaves that read
+  as "the wind got up" have to be shed at the moment it does.
+- Fixed blown leaves travelling in straight parallel lines. The gust velocity was a single constant
+  written to every emitter, so every leaf on the island moved at exactly the same speed in exactly
+  the same direction. It is a random range per particle now, including a little of it downward, and
+  the noise field the game flutters its leaves on is turned up for the length of the gust and put
+  back after - which is what makes a blown leaf tumble instead of slide.
+- Leaves being rolled along the ground were doing it at a flat 1.4 m/s regardless of leaf or wind.
+  They are back to being carried at a speed set by the gust, and each leaf's own `DriftFactor` now
+  scales how far it is carried, how hard it swings across the wind and how quickly it picks the
+  gust up, so a drift of them no longer moves as one sheet.
+
+- Fixed the river emptying of leaves over a session while the fountains silted up. The status log
+  told the whole story: `water=300 ... spawned=0/0/0/0`, the water budget pinned at its ceiling
+  with nothing in it moving and nothing able to spawn. A leaf that reaches standing water - a
+  fountain basin, a closed pool, the open sea - never leaves it again, so under one shared ceiling
+  the still bodies take every slot within the hour and the river, whose leaves do flow away and are
+  culled at range, is left with none. Standing water now has its own ceiling of a fifth of the
+  budget, and a second ceiling per body of roughly one leaf per four square metres of surface, so a
+  two-metre fountain basin takes a handful rather than the same crowd as a pool ten times its size.
+- A leaf on standing water now goes waterlogged and sinks after 45 to 105 seconds, fading out over
+  three. Nothing is carrying it, so without a clock of its own it is there for the session; with
+  one, the still bodies turn over and their slots keep coming back to the water that moves.
+
+- Fixed leaves stranding on the rim of the hot spring. Two causes. The pool is about eight metres
+  across and the waterfall only takes the middle 1.2 m of its lip, but the leaves were steered
+  towards the lip across the pool's full width, so anything arriving off-centre reached the rim and
+  stopped. They are funnelled now: the further down the pool a leaf is, the less room it is given
+  either side of the centre, until at the lip itself it is inside the mouth of the fall. Second,
+  any leaf whose five candidate steps all failed simply sat there forever - it now notices it has
+  stopped moving, opens the search to the full circle, and after twelve seconds of finding nothing
+  in any direction accepts that it has run aground and fades out. Only leaves that ought to be
+  moving are judged this way; one loitering on still water is meant to go nowhere.
+
+- Fixed airborne leaves and leaves rolling along the ground looking like two separate systems. The
+  gust force field's direction is an *acceleration*, not a speed: at 2.2 it ran at, five seconds of
+  gust put an airborne leaf past 10 m/s while the ones on the ground were being carried at three.
+  The field is down to 0.9 with drag under it, so it settles at a terminal speed instead of
+  climbing for the whole gust, and it is now the turbulence rather than the push - the steady push
+  comes from the emitters' velocity module, at a speed matched to the ground leaves'.
+- Fixed blown leaves appearing to go in all directions. Unity draws each axis of the velocity
+  module from its own random value, so the half-to-one-and-a-half range meant to vary their *speeds*
+  was swinging each leaf's *heading* by up to twenty-five degrees instead. It is a narrow range
+  now, and the noise boost over a gust is down from 2.4x to 1x; the variety comes from the force
+  field, which is the part that is supposed to look turbulent.
+- Leaves lifted off the ground are carried a little faster again to meet them in the middle.
+
+- Fixed leaves on the water drifting in single file. Every one of them moved at the same 0.6 m/s
+  and was steered back onto the river's centreline, so they queued up along one line. Each leaf now
+  holds its own lane across the channel - sliding slowly across it rather than pinned to it - has
+  its own pace between 0.34 and 0.88 m/s, takes its step on its own stagger rather than on a shared
+  tick, and turns its own way.
+- Fixed leaves on closed water setting off downstream. `RiverLeafDirection` returned a heading for
+  any position at all, so a leaf on a pond with no outlet, or out at sea, was handed the direction
+  of the nearest reach of a river it was not on and marched off into the bank. The current now only
+  applies within 4.5 m of the sampled centreline; anywhere else the leaf wanders slowly on a
+  heading of its own, which is what a leaf on still water does.
+
+- Raised the floor under the leaf lighting. The main light has a floor beneath it (`Minimum visible
+  night light`) so that trees, paths and people stay readable after dark; the leaves had none and
+  bottomed out near black, so a leaf sat several stops below the ground it was lying on and read as
+  a hole in it. The same setting now floors the leaves, and the moonlit base they fall back to is
+  no longer as crushed.
+
+## 1.0.1.7
+
+- Fixed the gust reading as constant wind. The gusts themselves were fine - the log shows them
+  50 to 70 seconds apart, four to eight seconds each, about a 10% duty cycle. The problem was that
+  the canopies already sway a little all the time at the game's own settings, and a gust that only
+  widened that sway was not distinguishable from the resting state. Wind is felt as movement
+  getting *faster*, so the shader's wind speed is now driven alongside its strength (the canopies
+  spell it `_WindSpeed`, the outlines `_Windspeed`; both are handled). A gust now also arrives in
+  0.45 s rather than 1.4 s - fading in over a second and a half read as the weather slowly
+  changing rather than as a gust.
+- Fixed leaves on the ground appearing not to be lifted. They were: every leaf moved at 1.8 m/s and
+  was removed after 2.5 m, which emptied the ground within a second and a half - that does not read
+  as leaves being carried off, it reads as them vanishing. Only the loosest third of them are taken
+  now, and each one that goes is thrown up into the air on the gust rather than deleted, which is
+  the part that actually reads as the wind taking it. The rest shuffle and turn where they lie,
+  capped at half a metre.
+- The gust clock is now unscaled, like every other clock in this plugin: the game scales time in
+  places, and a gust that stalled mid-blow would never have ended.
+
+- Bundled `autumn_leaf_step.ogg` (Feet in Leaves #1, Joseph SARDIN, CC0 via BigSoundBank). Source,
+  licence and checksum are recorded in `audio/THIRD_PARTY_AUDIO.md`.
+- The wind is synthesised when no `wind_gust` file is supplied. BigSoundBank has no sudden gust -
+  its fourteen wind recordings are all long steady ambiences - and a generated bed has a real
+  advantage anyway: it is driven straight off the gust envelope, in both volume and pitch, so the
+  sound arrives with the wind instead of being a recording faded up underneath it. Filtered noise
+  with a slow swell and a cross-faded seamless loop; measured across one-pole bands it falls
+  100 / 57 / 47 / 31 / 18 / 4 from below 80 Hz to above 8 kHz. A `wind_gust` file still takes
+  precedence if one is present.
+- The generated clip is filled through a PCM reader callback rather than `AudioClip.SetData`: in
+  this Unity version SetData's only overload takes a `ReadOnlySpan`, which the C# 5 compiler this
+  plugin is built with cannot resolve, and referencing the assembly that defines it collides with
+  the compiler's own mscorlib.
+
+## 1.0.1.6
+
+- The autumn sun sits lower. `[Season] Sun elevation multiplier` (default 0.76) scales the noon
+  height, which is most of what makes autumn light read as autumn: longer shadows all day, and
+  everything lit more from the side than from above. It scales the configured noon elevation rather
+  than the live angle, so the whole arc comes down together and dawn and dusk stay where the clock
+  puts them.
+- Added the harvest moon: autumn nights get a deep golden moon a third again as large.
+- Leaves land on water. They settle on the sea and the ponds as well, lying flat however the
+  surface is angled, riding a slow swell and drifting on a wandering current - a gust pushes them
+  much less than one caught on grass, and they are allowed to travel far further before they count
+  as gone. They share the ground-leaf limit.
+- Walking through fallen leaves kicks up two or three scraps, thrown backwards from alternating
+  sides of the player with enough lift to arc over and drop. Gated on there actually being leaves
+  underfoot, so crossing bare ground does nothing.
+
+- Autumn swaps the cicadas for crows. The cicada bed fades out entirely in autumn, and an
+  occasional crow calls through the day instead - spread around a configured rate rather than on a
+  metronome, and quiet after dark.
+- Added three optional sound slots, all silent unless the file is present: `autumn_leaf_step` for
+  the crunch underfoot, `wind_gust` for the wind during a gust (its volume rides the gust envelope
+  directly), and `crow_call`. The loader now takes `.ogg`, `.wav` or `.mp3` and resolves each by
+  base name, so a file can be dropped in without converting it first. A footstep plays a third of a
+  second from a random point in its clip, so no two footfalls sound the same out of one recording.
+
+## 1.0.1.5
+
+- Canopy shadows are no longer made of squares. The perforated shell is a grid, so every hole was
+  an axis-aligned rectangle and the dapples read as pixel art. The grid points are now pushed off
+  the lattice by up to about three quarters of a cell before the shell is built - shared between
+  the cells that meet at each point, so the shell stays closed and it is the lattice that moves,
+  not each cell on its own. The grid also went from 16 to 18, which makes each dapple smaller.
+- Falling leaves are lit. Their material is `Universal Render Pipeline/Unlit`, which reads neither
+  vertex colour nor the particle's own start colour, so a shared material could only ever have one
+  brightness for the whole island - which is why they stayed bright at night. Each emitter now
+  carries the light of the tree it belongs to on a per-renderer property block.
+- Leaves on the ground are lit per leaf, so one lying under a lamp is lit and the one beside it is
+  not. They previously followed the day cycle alone and stayed dark under a lamp at night. This
+  needed the ground layer to move off URP's unlit shader, which ignores vertex colour, onto
+  `Sprites/Default`, which multiplies the texture by it; the light for each leaf is refreshed a
+  third at a time and pushed to the mesh as colours only, without rebuilding the geometry. The
+  brightness comes from `ComputeFaceBrightness`, the same function that lights the avatars' face
+  overlays, so it already accounts for the day cycle and every lamp in range.
+- Added `[Season] Water depth tint` (default 0.5): the sea and ponds go a deeper, colder blue in
+  autumn. The horizon band takes only a third of it - where sea meets sky it has to keep following
+  the sky, or dusk lands on the grey this sea was tuned out of two versions ago.
+
+- Added gusts of wind, under `[Weather]` and on in both seasons. Every so often - about every 50
+  seconds by default - a gust crosses the island from a new direction for four to nine seconds,
+  rising quickly and dying away slowly. Three things move with it:
+  - The canopies lean and sway. The canopy shader animates its own vertices from `_WindStrength`,
+    so the gust is that value going up across every material that has one. That deliberately
+    includes the outline materials: an outline that does not sway with the canopy it outlines comes
+    away from it.
+  - Falling leaves are blown sideways and lifted a little, through a single
+    `ParticleSystemForceField` parked on the camera that every leaf emitter is opted into. Far
+    simpler than reaching into each particle system's velocity module, and it leaves their authored
+    motion intact.
+  - Leaves already on the ground skitter along and spin as they go, each at its own rate, and are
+    carried off once they have travelled a couple of metres. New ones keep arriving, so a gust
+    reshuffles the ground layer rather than emptying it.
+
+## 1.0.1.4
 
 - Fixed canopy shadows disappearing instead of becoming dappled. The stand-in that casts them was
   built on a material made at runtime from `Shader.Find("Universal Render Pipeline/Unlit")`, and a
@@ -22,7 +268,7 @@
   table, so the slider reaches it. The table still holds the material, which is what captures the
   authored colour and puts it back on uninstall.
 
-# 1.0.1.3 (unreleased)
+## 1.0.1.3
 
 Both of these are about the round tree canopies, and neither is specific to autumn.
 
@@ -66,7 +312,7 @@ Both of these are about the round tree canopies, and neither is specific to autu
   leaves it at 20%. Holes are weighted toward the rim, because the middle of a crown is denser than
   its edge.
 
-# 1.0.1.2 (unreleased)
+## 1.0.1.2
 
 Autumn, second pass, all of it from playing the first one.
 
@@ -120,7 +366,7 @@ Autumn, second pass, all of it from playing the first one.
   browns and mauves that lie on the line between them; stepping is also what a real Halloween
   light string does.
 
-# 1.0.1.1 (unreleased)
+## 1.0.1.1
 
 - Cheeks follow the face-marks menu again. The plugin lights the avatar's unlit face overlays by
   giving each slot its own material and scaling that material's colour by the light reaching the

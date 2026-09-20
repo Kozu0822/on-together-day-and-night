@@ -1,8 +1,8 @@
 {
   "name": "OnTogether_Day_and_Night",
-  "version_number": "1.0.1",
-  "website_url": "",
-  "description": "A configurable real-time day and night cycle with weather, water, shadows, scene lighting, and ambience for On-Together.",
+  "version_number": "1.0.2",
+  "website_url": "https://github.com/Kozu0822/on-together-day-and-night",
+  "description": "A real-time day and night cycle for On-Together, with weather, gusts, water, shadows, scene lighting and ambience - plus an autumn season that repaints the island and sheds leaves that drift on the wind and the water.",
   "dependencies": [
     "BepInEx-BepInExPack-5.4.2305"
   ]

@@ -8,14 +8,16 @@ at any time to make the island feel like your own.
 
 > **日本語:** On-Together 向けの昼夜・季節・環境演出モッドです。F11 の設定メニューから、時間の流れ、空や水面、照明、秋の景観、環境音をその場で調整できます。
 
-![Four moments on the island: summer day, autumn day, night, and dawn](images/day-night-cycle.png)
+![Four moments on the island: summer day, autumn day, night, and dawn](https://raw.githubusercontent.com/Kozu0822/on-together-day-and-night/main/images/day-night-cycle.png)
 
 ## Highlights
 
 - Watch the world shift naturally through dawn, daytime, sunset, moonlight, stars, clouds, and rain.
 - Set the day length to suit your play style—from a fast in-game cycle to one full real-world day.
 - See the sky reflected in the sea, with scene lighting that warms up after dark.
-- Give the island an autumn makeover with colourful foliage, falling leaves, and optional Halloween lights.
+- Give the island an autumn makeover: red and gold foliage, leaves that fall, settle where they
+  land and drift away on the water, crows over the lawn, a harvest moon, and optional Halloween lights.
+- Feel a gust cross the island now and then, setting the canopies swaying and scattering the fallen leaves.
 - Add daytime cicadas and nighttime insects, each with its own volume control.
 - Tune lighting, shadows, weather, water, ambience, and seasonal settings live with the F11 menu.
 
@@ -47,5 +49,6 @@ or its developers.
 
 ## Third-party audio
 
-The bundled cicada and night-insect recordings are CC0. Their source and licence details are in
+The bundled cicada, night-insect, crow and leaf-step recordings are CC0. Their sources and
+licence details are in
 [`audio/THIRD_PARTY_AUDIO.md`](audio/THIRD_PARTY_AUDIO.md).
